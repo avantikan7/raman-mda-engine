@@ -42,6 +42,8 @@ class fakeAcquirer:
         arr = np.random.randn(points.shape[0], 1340) * exposure
         return np.cumsum(arr, axis=1)
 class RamanEngine(MDAEngine):
+    _FILTER_DEVICE = "DigitalIO"
+    _FILTER_MASK = 1 << 1  # Dev1/port0/line1
     def __init__(
         self,
         mmc: CMMCorePlus = None,
@@ -57,7 +59,7 @@ class RamanEngine(MDAEngine):
         image_p=np.array([0]),
         segment_and_track=True,
         segment_channel='BF',
-        shutter_device='Fluoshutter',
+        shutter_device=None,
         segment_crop=True,
         cellpose_model='cyto2',
         tracking_config='particle_config.json',
@@ -135,6 +137,7 @@ class RamanEngine(MDAEngine):
         self._skip_imaging_for_same_pos = skip_imaging_for_same_pos
         self._last_operation_reloaded = False
         self._autofocus_search_range = autofocus_search_range
+        self._laser_autofocus_active = False
         self._search_pts = search_pts
         self._fine_search_range = fine_search_range
         self._fine_search_pts = fine_search_pts
@@ -197,6 +200,27 @@ class RamanEngine(MDAEngine):
         if event.channel is not None:
             return event.channel.group
         return self._mmc.getChannelGroup() or "Channel"
+
+    def _set_focus_filter(self, inserted: bool) -> None:
+        """Control port0/line1 through Micro-Manager's port-wide DigitalIO device."""
+        if self._FILTER_DEVICE not in self._mmc.getLoadedDevices():
+            if inserted:
+                raise LookupError(
+                    f"Cannot insert focus filter: "
+                    f"{self._FILTER_DEVICE!r} is not loaded."
+                )
+            return
+
+        current = int(self._mmc.getState(self._FILTER_DEVICE))
+        desired = (
+            current | self._FILTER_MASK
+            if inserted
+            else current & ~self._FILTER_MASK
+        )
+
+        if desired != current:
+            self._mmc.setState(self._FILTER_DEVICE, desired)
+            self._mmc.waitForDevice(self._FILTER_DEVICE)
 
     def record_raman(self, event: MDAEvent):
         """
@@ -594,6 +618,9 @@ class RamanEngine(MDAEngine):
                 # QTimer.singleShot(0, lambda: self._mmc.setConfig(channel, group))
                 # self._mmc.setExposure(10)
                 self._mmc.waitForSystem()
+                self._set_focus_filter(
+                    self._laser_autofocus_active and group == "RM"
+                )
                 # QTimer.singleShot(0, lambda: self._mmc.waitForSystem())
                 # time.sleep(0.25)
                 return  # success!
@@ -619,7 +646,7 @@ class RamanEngine(MDAEngine):
         n = 0  # starting sleep time
         for attempt in range(N):
             if attempt == int(N/2):
-                print('set shutter reach maxiter, reloading...')
+                print('set exposure time reach maxiter, reloading...')
                 self.reload()
             try:
                 time.sleep(n)
@@ -760,42 +787,55 @@ class RamanEngine(MDAEngine):
             # --- coarse laser scan: uses class-level search_pts ---
 
             volts = self._transformer.BF_to_volts((pt.reshape(1, -1)*[self._image_x, self._image_y])/[self._image_y, self._image_x], max_volts=self._max_volt)
-            _ = self._spectra_collector.collect_spectra_pts(np.array([volts[0], volts[0]]), 100)
+            # _ = self._spectra_collector.collect_spectra_pts(np.array([volts[0], volts[0]]), 100)
             coarse_Z = np.linspace(-search_range, search_range, search_pts)
             figs = []
             something_broke = 0
-            self.try_set_config("Channel", "RM")
-            for z in tqdm(coarse_Z):
-                self.try_set_ZPosition(focusZ+z)
-                self.try_setExp(0.1)
-                fig = self.try_snap()
-                figs.append(fig)
-                if self._last_operation_reloaded:
-                    something_broke += 1
-            figs = np.asarray(figs)
-            # np.save(f'debug1/figs_{t}_{p}.npy', figs)
-            # np.save(f'debug1/zs_{t}_{p}.npy', coarse_Z + focusZ)
-            scores = figs.sum(axis=1)
-            coarse_max = coarse_Z[np.argmax(np.max(scores, axis=1))] + focusZ
-            # --- fine laser scan: uses dedicated fine_search_range / fine_search_pts ---
-            fine_Z = np.linspace(-self._fine_search_range, self._fine_search_range, self._fine_search_pts)
-            figs = []
-            something_broke = 0
-            for z in tqdm(fine_Z):
-                self.try_set_ZPosition(coarse_max+z)
-                # self.try_set_config("Channel", "RM")
-                # self.try_setExp(0.1)
-                fig = self.try_snap()
-                figs.append(fig)
-                if self._last_operation_reloaded:
-                    something_broke += 1
-            figs = np.asarray(figs)
-            # np.save(f'debug2/figs_{t}_{p}.npy', figs)
-            # np.save(f'debug2/zs_{t}_{p}.npy', fine_Z + coarse_max)
-            scores = figs.sum(axis=1)
-            max_laser_offset = fine_Z[np.argmax(np.max(scores, axis=1))] - focusZ + coarse_max - self._raman_glass_offset
-            coarse_raman = None
 
+            self._laser_autofocus_active = True
+            try:
+                # try_set_config writes RM=1, then adds the filter bit,
+                # producing port state 3.
+                self.try_set_config("Channel", "RM")
+
+                _ = self._spectra_collector.collect_spectra_pts(
+                    np.array([volts[0], volts[0]]),
+                    100,
+                )
+                for z in tqdm(coarse_Z):
+                    self.try_set_ZPosition(focusZ+z)
+                    self.try_setExp(0.1)
+                    fig = self.try_snap()
+                    figs.append(fig)
+                    if self._last_operation_reloaded:
+                        something_broke += 1
+                figs = np.asarray(figs)
+                # np.save(f'debug1/figs_{t}_{p}.npy', figs)
+                # np.save(f'debug1/zs_{t}_{p}.npy', coarse_Z + focusZ)
+                scores = figs.sum(axis=1)
+                coarse_max = coarse_Z[np.argmax(np.max(scores, axis=1))] + focusZ
+                # --- fine laser scan: uses dedicated fine_search_range / fine_search_pts ---
+                fine_Z = np.linspace(-self._fine_search_range, self._fine_search_range, self._fine_search_pts)
+                figs = []
+                something_broke = 0
+                for z in tqdm(fine_Z):
+                    self.try_set_ZPosition(coarse_max+z)
+                    # self.try_set_config("Channel", "RM")
+                    # self.try_setExp(0.1)
+                    fig = self.try_snap()
+                    figs.append(fig)
+                    if self._last_operation_reloaded:
+                        something_broke += 1
+                figs = np.asarray(figs)
+                # np.save(f'debug2/figs_{t}_{p}.npy', figs)
+                # np.save(f'debug2/zs_{t}_{p}.npy', fine_Z + coarse_max)
+                scores = figs.sum(axis=1)
+                max_laser_offset = fine_Z[np.argmax(np.max(scores, axis=1))] - focusZ + coarse_max - self._raman_glass_offset
+                coarse_raman = None
+            finally:
+                self._laser_autofocus_active = False
+                # Converts RM+filter (3) back to ordinary RM (1).
+                self._set_focus_filter(False)
         # self.try_setShutter("Fluoshutter", False)
         if np.abs(max_laser_offset) >= 3*search_range or something_broke != 0:
             return focusZ, last_z, coarse_raman
@@ -888,11 +928,12 @@ class RamanEngine(MDAEngine):
         channel = event.channel
         if self._rm_meta:
             if event.channel.config == self._rm_channel and event.index["z"] in self._rm_z:
-                self.try_setShutter("Fluoshutter", True)
+                # self.try_setShutter("Fluoshutter", True)
+                
                 self.record_raman(event)
-                if shutter:
+                # if shutter:
                     # self.try_setShutter(shutter, False)
-                    self.try_set_config(self._channel_group_for_event(event), "BF")
+                self.try_set_config(self._channel_group_for_event(event), "BF")
         if self._skip_imaging_for_same_pos:
             if event.index["p"] in self._image_p:
                 self.try_snap_image()
