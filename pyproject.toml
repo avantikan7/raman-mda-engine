@@ -45,6 +45,12 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
+tracking = [
+    "btrack",
+    "cellpose",
+    "matplotlib",
+    "scikit-image",
+]
 testing = ["PyQt5", "pytest", "pytest-cov", "pytest-qt", "qtpy"]
 dev = [
     "black",

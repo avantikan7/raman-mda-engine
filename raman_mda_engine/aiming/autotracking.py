@@ -1,12 +1,8 @@
 from __future__ import annotations
 from skimage.transform import rescale
 import numpy as np
-from cellpose.models import Cellpose
 from time import perf_counter
-from matplotlib import pyplot as plt
 from scipy import ndimage as ndi
-import btrack
-from pathlib import Path
 from scipy.ndimage import center_of_mass
 
 __all__= [
@@ -130,9 +126,32 @@ import numpy as np
 from scipy import ndimage as ndi
 from scipy.ndimage import center_of_mass
 import multiprocessing as mp
-import btrack
+
+
+def _new_cellpose_model():
+    """Create Cellpose without making it a package import-time dependency."""
+    try:
+        from cellpose.models import Cellpose
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "Cellpose/PyTorch could not be loaded. Install the "
+            "'raman-mda-engine[tracking]' extra in a binary-consistent "
+            "environment. On Windows, do not mix Conda MKL/OpenMP runtimes "
+            "with a pip PyTorch wheel."
+        ) from exc
+
+    return Cellpose(model_type="cyto2", gpu=False)
+
 
 def run_tracking(labels, radius):
+    try:
+        import btrack
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "BTrack could not be loaded. Install the "
+            "'raman-mda-engine[tracking]' extra."
+        ) from exc
+
     objects = btrack.utils.segmentation_to_objects(labels)
     with btrack.BayesianTracker(verbose=False) as tracker:
         tracker.configure("particle_config.json")
@@ -215,7 +234,7 @@ def mask_outside_circle(img, circle_center=(540, 740), circle_radius=400):
 
 
 def segment_single_img(img: np.ndarray, scale: int = 4, crop=True):
-    model = Cellpose(model_type = "cyto2", gpu=False)
+    model = _new_cellpose_model()
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
@@ -263,7 +282,7 @@ def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float
     t_start = perf_counter()
     t0 = perf_counter()
 
-    model = Cellpose(model_type = "cyto2", gpu=False)
+    model = _new_cellpose_model()
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
@@ -306,6 +325,8 @@ def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float
     new_aim = np.asarray(new_aim)
 
     if plot:
+        from matplotlib import pyplot as plt
+
         fig, ax = plt.subplots(1, 2, figsize=(12, 4), sharex=True, sharey=True)
         ax[0].imshow(seg_imgs, cmap='gray')
         ax[0].scatter(pt_xy[:, 1]/scale, pt_xy[:, 0]/scale, c='r', marker='x')

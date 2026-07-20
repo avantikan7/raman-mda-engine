@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 from numbers import Real
 from typing import TYPE_CHECKING, Any, NamedTuple
-from raman_mda_engine.aiming.autotracking import update_pos_points, segment_single_img, track_one_T
 # from cns_control.autofocus import autofocus_w_raman
 from pymmcore_plus.mda._engine import ImagePayload
 import numpy as np
@@ -59,7 +58,7 @@ class RamanEngine(MDAEngine):
         default_rm_exp: float = 20.0,
         spectra_collector=None,
         transformer=None,
-        max_volt=1.8,
+        max_volt=1.6,
         sources: list[RamanAimingSource] = None,
         batch=False,
         autofocus=True,
@@ -76,6 +75,7 @@ class RamanEngine(MDAEngine):
         refocus_every=1,
         image_x=1344,
         image_y=1024,
+        config_file = None,
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -104,6 +104,10 @@ class RamanEngine(MDAEngine):
         image_y : int
             Y size of the camera image in pixels.
         """
+        # MDAEngine uses the core immediately during its initialization (for
+        # example, to read the auto-shutter state), so it must never receive
+        # None. Resolve the singleton before calling the base constructor.
+        mmc = mmc or CMMCorePlus.instance()
         super().__init__(mmc)
         self.raman_events = RamanSignaler()
         self._rng = np.random.default_rng()
@@ -128,6 +132,7 @@ class RamanEngine(MDAEngine):
         self._fine_search_range = fine_search_range
         self._fine_search_pts = fine_search_pts
         self._refocus_every = max(1, int(refocus_every))
+        self._config_file = config_file
         # image dimensions in pixels (X = 1344, Y = 1024 by default)
         self._image_x = image_x
         self._image_y = image_y
@@ -146,8 +151,7 @@ class RamanEngine(MDAEngine):
         self.aiming_sources = sources if sources is not None else []
         self._sources: list[RamanAimingSource]
 
-        # default engine doesn't do this in super to avoid import loops
-        self._mmc = CMMCorePlus.instance()
+        # ``super().__init__`` stored the resolved core in ``self._mmc``.
 
     @property
     def aiming_sources(self) -> list[RamanAimingSource]:
@@ -186,6 +190,12 @@ class RamanEngine(MDAEngine):
 
     def _event_to_index(self, event: MDAEvent) -> tuple[int, ...]:
         return tuple(event.index[a] for a in self._axis_order)
+
+    def _channel_group_for_event(self, event: MDAEvent) -> str:
+        """Return the config group even when a sequence has no channel axis."""
+        if event.channel is not None:
+            return event.channel.group
+        return self._mmc.getChannelGroup() or "Channel"
 
     def record_raman(self, event: MDAEvent):
         """
@@ -265,7 +275,7 @@ class RamanEngine(MDAEngine):
         #     points, self._default_rm_exp
         # )
         # self._mmc.setConfig(event.channel.group, "RM")
-        self.try_set_config(event.channel.group, "RM")
+        self.try_set_config(self._channel_group_for_event(event), "RM")
         volts = self._transformer.BF_to_volts((points*[self._image_x, self._image_y])[:, :]/[self._image_y, self._image_x], max_volts = self._max_volt)
         _ = self._spectra_collector.collect_spectra_pts(np.tile(volts[0], (2, 1)), 100)
         if not self._batch:
@@ -368,6 +378,15 @@ class RamanEngine(MDAEngine):
         self._tracks = {}
 
     def update_aim(self, pos, event, img, use_same_img=False):
+        # Segmentation and tracking are optional. Import them only when this
+        # feature is enabled so importing/using the core engine with napari does
+        # not initialize Cellpose, BTrack, or PyTorch.
+        from raman_mda_engine.aiming.autotracking import (
+            segment_single_img,
+            track_one_T,
+            update_pos_points,
+        )
+
         print('-----------updating aim-----------')
         points = []
         which = []
@@ -466,11 +485,14 @@ class RamanEngine(MDAEngine):
                     None
 
                 self._mmc.unloadAllDevices()
-                self._mmc.loadSystemConfiguration("test3.cfg")
+                if self._config_file == None:
+                    self._mmc.loadSystemConfiguration("test3.cfg")
+                else:
+                    self._mmc.loadSystemConfiguration(self._config_file)
                 self._mmc.waitForSystem()
                 # QTimer.singleShot(0, lambda: self._mmc.unloadAllDevices())
                 # QTimer.singleShot(0, lambda: self._mmc.loadSystemConfiguration("test3.cfg"))
-                self.try_set_config("Channel", "GFP")
+                # self.try_set_config("Channel", "GFP")
                 self.try_set_config("Channel", "BF")
                 # QTimer.singleShot(0, lambda: self._mmc.waitForSystem())
                 self._mmc.waitForSystem()
@@ -677,7 +699,7 @@ class RamanEngine(MDAEngine):
 
         return best_index, scores
 
-    def autofocus_w_raman(self, last_z, pt, t, p, max_volt=1.8):
+    def autofocus_w_raman(self, last_z, pt, t, p, max_volt=1.6):
         focusZ = self.try_get_ZPosition()
         object = self._autofocus_object
         # NOTE: search_pts is now a single class-level argument (self._search_pts)
@@ -716,7 +738,7 @@ class RamanEngine(MDAEngine):
             #     volts = np.array([[0,0], [0,0]])
 
             self.try_set_config("Channel", "RM")
-            self.try_setShutter("Fluoshutter", True)
+            # self.try_setShutter("Fluoshutter", True)
 
             coarse_Z = np.linspace(-search_range, search_range, search_pts)
             coarse_raman = []
@@ -763,7 +785,7 @@ class RamanEngine(MDAEngine):
                 # # y_peak = y_fine[max_index]
                 # max_laser_offset = x_peak
                 # print(focusZ + x_fine[np.argmin(np.abs(y_fine_glass - 0.5))])
-                # popt, _ = curve_fit(normalized_tanh, coarse_Z, cell_raman, p0=[0, 2], method='trf')
+                # popt, _ = curve_fit(normalized︃_tanh, coarse_Z, cell_raman, p0=[0, 2], method='trf')
                 # max_laser_offset = popt[0]-self._raman_glass_offset # 2 is the default offset between rm cell and rm glass, change accordingly
                 max_laser_offset = x_fine[np.argmin(np.abs(y_fine_glass - 0.5))] - self._raman_glass_offset
 
@@ -796,6 +818,9 @@ class RamanEngine(MDAEngine):
 
         elif object == 'laser':
             # --- coarse laser scan: uses class-level search_pts ---
+
+            volts = self._transformer.BF_to_volts((pt.reshape(1, -1)*[self._image_x, self._image_y])/[self._image_y, self._image_x], max_volts=self._max_volt)
+            _ = self._spectra_collector.collect_spectra_pts(np.array([volts[0], volts[0]]), 100)
             coarse_Z = np.linspace(-search_range, search_range, search_pts)
             figs = []
             something_broke = 0
@@ -836,7 +861,7 @@ class RamanEngine(MDAEngine):
             max_laser_offset = fine_Z[np.argmax(np.max(scores, axis=1))] - focusZ + coarse_max - self._raman_glass_offset
             coarse_raman = None
 
-        self.try_setShutter("Fluoshutter", False)
+        # self.try_setShutter("Fluoshutter", False)
         if np.abs(max_laser_offset) >= 3*search_range or something_broke != 0:
             return focusZ, last_z, coarse_raman
 
@@ -895,7 +920,7 @@ class RamanEngine(MDAEngine):
                     if self._segment_and_track and do_refocus:
                         self.try_set_ZPosition(self._last_best_z[pos] + self._raman_glass_offset)
                         time.sleep(0.5)
-                        self.try_set_config(event.channel.group, "BF")
+                        self.try_set_config(self._channel_group_for_event(event), "BF")
                         self.try_setExp(10)
                         self.try_snap_image()
                         image = self.try_get_image()
@@ -921,12 +946,14 @@ class RamanEngine(MDAEngine):
 
 
     def exec_event(self, event: MDAEvent) -> Any:
+        channel = event.channel
         if self._rm_meta:
-            if event.channel.config == self._rm_channel and event.index["z"] in self._rm_z:
-                self.try_setShutter("Fluoshutter", True)
+            channel_matches = channel is None or channel.config == self._rm_channel
+            if channel_matches and event.index["z"] in self._rm_z:
+                # self.try_setShutter("Fluoshutter", True)
                 self.record_raman(event)
-                self.try_setShutter("Fluoshutter", False)
-                self.try_set_config(event.channel.group, "BF")
+                # self.try_setShutter("Fluoshutter", False)
+                self.try_set_config(self._channel_group_for_event(event), "BF")
 
         if self._skip_imaging_for_same_pos:
             if event.index["p"] in self._autofocus_p:
@@ -937,9 +964,10 @@ class RamanEngine(MDAEngine):
                     # (event.index["z"] == 2)
                     # Can always set back to BF after GFP
                     # because always doing BF next.
-                    and (event.channel.config == "GFP")
+                    and channel is not None
+                    and channel.config == "GFP"
                 ):
-                    self.try_set_config(event.channel.group, "BF")
+                    self.try_set_config(channel.group, "BF")
 
                 meta = self.get_frame_metadata(event)
                 image = self.try_get_image()
@@ -953,9 +981,10 @@ class RamanEngine(MDAEngine):
                 # (event.index["z"] == 2)
                 # Can always set back to BF after GFP
                 # because always doing BF next.
-                and (event.channel.config == "GFP")
+                and channel is not None
+                and channel.config == "GFP"
             ):
-                self.try_set_config(event.channel.group, "BF")
+                self.try_set_config(channel.group, "BF")
 
             meta = self.get_frame_metadata(event)
             image = self.try_get_image()
