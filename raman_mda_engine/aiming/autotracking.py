@@ -12,115 +12,6 @@ __all__= [
     "update_pos_points",
 ]
 
-# def track_one_T(labels: np.ndarray, scale: int, pts, radius: float=15):
-#     radius = radius / scale
-    
-#     objects = btrack.utils.segmentation_to_objects(labels)
-#     with btrack.BayesianTracker(verbose=False) as tracker:
-#         tracker.configure(Path(__file__) / "particle_config.json")
-#         tracker.max_search_radius = radius
-
-#         # append the objects to be tracked
-#         tracker.append(objects)
-
-#         # set the tracking volume
-#         tracker.volume = ((0, labels.shape[-2]), (0, labels.shape[-1]), (-1e5, 1e5))
-
-#         # track them (in interactive mode)
-#         tracker.track(step_size=100)
-
-#         # generate hypotheses and run the global optimizer
-#         tracker.optimize()
-
-#         # tracker.export(tracks_out, obj_type='obj_type_1')
-#         tracks = tracker.tracks
-#     # all_tracks = pd.concat([pd.DataFrame(t.to_dict()) for t in tracks])
-#     tracked = btrack.utils.update_segmentation(labels, tracks)
-    
-#     # return tracked
-#     pts = np.atleast_2d(pts)
-    
-#     new_aim = []
-#     for pt in pts:
-#         pt = (np.array(pt)/scale).astype(int)
-#         label = tracked[0, pt[0], pt[1]]
-#         if np.sum(tracked[1] == label) != 0:
-#             new_aim.append((np.array(ndi.center_of_mass(tracked[1]==label))*scale))
-#         else:
-#             new_aim.append((pt*scale).astype(int)) 
-            
-#     return new_aim
-
-# def track_one_T(labels: np.ndarray, scale: int, pts, radius: float = 5, threshold=60, tracked=None, use_same_img=False):
-#     radius = radius / scale
-#     if not use_same_img:
-#         objects = btrack.utils.segmentation_to_objects(labels)
-#         with btrack.BayesianTracker(verbose=False) as tracker:
-#             tracker.configure("particle_config.json")
-#             tracker.max_search_radius = radius
-
-#             # append the objects to be tracked
-#             tracker.append(objects)
-
-#             # set the tracking volume
-#             tracker.volume = ((0, labels.shape[-2]), (0, labels.shape[-1]), (-1e5, 1e5))
-
-#             # track them (in interactive mode)
-#             tracker.track(step_size=100)
-
-#             # generate hypotheses and run the global optimizer
-#             tracker.optimize()
-
-#             # tracker.export(tracks_out, obj_type='obj_type_1')
-#             tracks = tracker.tracks
-#         # all_tracks = pd.concat([pd.DataFrame(t.to_dict()) for t in tracks])
-#         tracked = btrack.utils.update_segmentation(labels, tracks)
-
-#     # return tracked
-#     pts = np.atleast_2d(pts)
-
-#     new_aim = []
-#     for pt in pts:
-#         pt = (np.array(pt) / scale).astype(int)
-#         label = tracked[0, pt[0], pt[1]]
-#         if label == 0:
-#             # cellpose broke somehow, just leave it still and hope
-#             # for the best
-#             new_label = tracked[1, pt[0], pt[1]]
-#             if new_label == 0:
-#                 id = np.unique(tracked[1])
-#                 id = id[id != 0]  # Ignore background
-
-#                 coms = np.array([center_of_mass(tracked[1] == i) for i in id])
-#                 dists = np.linalg.norm(coms - pt, axis=1)
-
-#                 min_dist_idx = np.argmin(dists)
-#                 min_dist = dists[min_dist_idx]
-
-#                 if min_dist > 3*threshold/scale:
-#                     print(f"lost tracking of a cell {pt*scale}, no potential cells within threshold")
-#                     new_aim.append((pt * scale).astype(int))
-#                 else:
-#                     new_id = id[min_dist_idx]
-#                     print(f"lost tracking of a cell {pt*scale}, moved to closest point within threshold")
-#                     new_aim.append(
-#                         (np.array(ndi.center_of_mass(tracked[1] == new_id)) * scale)
-#                     )
-                
-#             else:
-#                 # send_slack_message(f"maybe lost tracking of a cell {pt*scale}")
-#                 print(f"maybe lost tracking of a cell {pt*scale}")
-#                 new_aim.append(
-#                     (np.array(ndi.center_of_mass(tracked[1] == new_label)) * scale)
-#                 )
-
-#         elif np.sum(tracked[1] == label) != 0:
-#             new_aim.append((np.array(ndi.center_of_mass(tracked[1] == label)) * scale))
-#         else:
-#             new_aim.append((pt * scale).astype(int))
-
-#     return tracked, new_aim
-
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -143,7 +34,7 @@ def _new_cellpose_model():
     return Cellpose(model_type="cyto2", gpu=False)
 
 
-def run_tracking(labels, radius):
+def run_tracking(labels, radius, tracking_config='particle_config.json'):
     try:
         import btrack
     except (ImportError, OSError) as exc:
@@ -154,7 +45,7 @@ def run_tracking(labels, radius):
 
     objects = btrack.utils.segmentation_to_objects(labels)
     with btrack.BayesianTracker(verbose=False) as tracker:
-        tracker.configure("particle_config.json")
+        tracker.configure(tracking_config)
         tracker.max_search_radius = radius
         tracker.volume = ((0, labels.shape[-2]), (0, labels.shape[-1]), (-1e5, 1e5))
         tracker.append(objects)
@@ -167,10 +58,10 @@ def run_tracking(labels, radius):
         
     return btrack.utils.update_segmentation(labels, tracks)
 
-def track_with_timeout(labels, radius, timeout_sec=30):
+def track_with_timeout(labels, radius, timeout_sec=30, tracking_config='particle_config.json'):
     ctx = mp.get_context("spawn")
     with ctx.Pool(1) as pool:
-        async_result = pool.apply_async(run_tracking, (labels, radius))
+        async_result = pool.apply_async(run_tracking, (labels, radius, tracking_config))
         try:
             return async_result.get(timeout=timeout_sec)
         except mp.context.TimeoutError:
@@ -180,10 +71,12 @@ def track_with_timeout(labels, radius, timeout_sec=30):
             print(f"BTrack failed in worker: {e!r}. Using fallback.")
             return None
 
-def track_one_T(labels: np.ndarray, scale: int, pts, radius: float = 5, threshold=60, tracked=None, use_same_img=False):
+def track_one_T(labels: np.ndarray, scale: int, pts, radius: float = 5, threshold=60,
+                tracked=None, use_same_img=False, tracking_config='particle_config.json'):
     radius = radius / scale
     if not use_same_img:
-        tracked = track_with_timeout(labels, radius, timeout_sec=300)
+        tracked = track_with_timeout(labels, radius, timeout_sec=300,
+                                     tracking_config=tracking_config)
         if tracked is None:
             # fallback: use raw segmentation with no tracking
             tracked = labels.copy()
@@ -233,8 +126,8 @@ def mask_outside_circle(img, circle_center=(540, 740), circle_radius=400):
     return masked_img
 
 
-def segment_single_img(img: np.ndarray, scale: int = 4, crop=True):
-    model = _new_cellpose_model()
+def segment_single_img(img: np.ndarray, scale: int = 4, crop=True, cellpose_model='cyto2'):
+    model = Cellpose(model_type = cellpose_model, gpu=False)
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
@@ -258,7 +151,7 @@ def segment_single_img(img: np.ndarray, scale: int = 4, crop=True):
     return masks
 
 
-def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float=80, plot=False)->np.ndarray:
+def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float=80, plot=False, cellpose_model='cyto2')->np.ndarray:
     """
     Find the COM of a moving object of interest by creating masks with cellpose.
     Return the closest match if no overlap is found, and return the input if the closest match is too far away.
@@ -282,7 +175,7 @@ def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float
     t_start = perf_counter()
     t0 = perf_counter()
 
-    model = _new_cellpose_model()
+    model = Cellpose(model_type = cellpose_model, gpu=False)
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
