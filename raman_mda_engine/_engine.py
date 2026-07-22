@@ -664,6 +664,23 @@ class RamanEngine(MDAEngine):
                 return  # success!
             except RuntimeError:
                 n += 1  # increase wait time and retry
+    def try_setAutoShutter(self, boolean, N=2):
+        n = 0  # starting sleep time
+        for attempt in range(N):
+            if attempt == int(N/2):
+                print('set shutter reach maxiter, reloading...')
+                self.reload()
+            try:
+                time.sleep(n)
+                self._mmc.setAutoShutter(boolean)
+                self._mmc.waitForSystem()
+                # QTimer.singleShot(0, lambda: self._mmc.setShutterOpen(shutter, boolean))
+                # QTimer.singleShot(0, lambda: self._mmc.waitForSystem())
+                # time.sleep(0.25)
+                return  # success!
+            except RuntimeError:
+                n += 1  # increase wait time and retry
+
     def software_autofocus(self, stack):
         """
         stack: numpy array of shape (N, X, Y)
@@ -686,6 +703,7 @@ class RamanEngine(MDAEngine):
     def autofocus_w_raman(self, last_z, pt, t, p, max_volt=1.6):
         focusZ = self.try_get_ZPosition()
         object = self._autofocus_object
+        shutter = self._shutter_device or "Fluoshutter"
         # NOTE: search_pts is now a single class-level argument (self._search_pts)
         # used by every autofocus object for the coarse scan. (Previously quartz
         # used 30 and the rest 20; set search_pts=30 on the engine if you want the
