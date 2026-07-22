@@ -74,6 +74,8 @@ class RamanEngine(MDAEngine):
         image_x=1344,
         image_y=1024,
         config_file = None,
+        circle_center=(512, 512),
+        circle_radius=100
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -147,6 +149,8 @@ class RamanEngine(MDAEngine):
         self._image_x = image_x
         self._image_y = image_y
         self._config_file = config_file
+        self._circle_center = circle_center
+        self._cricle_radius = circle_radius
         if self._spectra_collector is None:
             try:
                 from raman_control import SpectraCollector
@@ -409,6 +413,8 @@ class RamanEngine(MDAEngine):
             img, self._scale,
             crop=self._segment_crop,
             cellpose_model=self._cellpose_model,
+            circle_center=self._circle_center,
+            circle_radius=self._circle_radius
         )
         # Decide whether reusing the previous position's mask is even possible.
         can_reuse = (
@@ -583,7 +589,7 @@ class RamanEngine(MDAEngine):
                 # QTimer.singleShot(0, lambda: self._mmc.snapImage())
                 # QTimer.singleShot(0, lambda: self._mmc.waitForSystem())
                 # time.sleep(0.25)
-                return  fig # success!
+                return fig # success!
             except RuntimeError:
                 n += 1  # increase wait time and retry
     def try_get_image(self, N=2):
@@ -793,6 +799,8 @@ class RamanEngine(MDAEngine):
             something_broke = 0
 
             self._laser_autofocus_active = True
+            self._mmc.setAutoShutter(False)
+            self._mmc.setShutterOpen(True)
             try:
                 # try_set_config writes RM=1, then adds the filter bit,
                 # producing port state 3.
@@ -836,6 +844,8 @@ class RamanEngine(MDAEngine):
                 self._laser_autofocus_active = False
                 # Converts RM+filter (3) back to ordinary RM (1).
                 self._set_focus_filter(False)
+                self._mmc.setAutoShutter(True)
+                self._mmc.setShutterOpen(False)
         # self.try_setShutter("Fluoshutter", False)
         if np.abs(max_laser_offset) >= 3*search_range or something_broke != 0:
             return focusZ, last_z, coarse_raman
@@ -953,7 +963,8 @@ class RamanEngine(MDAEngine):
                 and (event.channel.config != "BF")
             ):
                 self.try_set_config(channel.group, "BF")
-
+            
             meta = self.get_frame_metadata(event)
             image = self.try_get_image()
             yield ImagePayload(image=image, event=event, metadata=meta)
+        

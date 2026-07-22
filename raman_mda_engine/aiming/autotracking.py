@@ -19,7 +19,7 @@ from scipy.ndimage import center_of_mass
 import multiprocessing as mp
 
 
-def _new_cellpose_model():
+def _new_cellpose_model(model="cyto2"):
     """Create Cellpose without making it a package import-time dependency."""
     try:
         from cellpose.models import Cellpose
@@ -31,7 +31,7 @@ def _new_cellpose_model():
             "with a pip PyTorch wheel."
         ) from exc
 
-    return Cellpose(model_type="cyto2", gpu=False)
+    return Cellpose(model_type=model, gpu=False)
 
 
 def run_tracking(labels, radius, tracking_config='particle_config.json'):
@@ -112,27 +112,44 @@ def track_one_T(labels: np.ndarray, scale: int, pts, radius: float = 5, threshol
 
     return tracked, new_aim
 
-def mask_outside_circle(img, circle_center=(540, 740), circle_radius=400):
-    h, w = img.shape
-    Y, X = np.ogrid[:h, :w]
+# def mask_outside_circle(img, circle_center, circle_radius):
+#     y, x = np.ogrid[:img.sizes["y"], :img.sizes["x"]]
+#     cx, cy = circle_center
 
-    dist_sq = (X - circle_center[0])**2 + (Y - circle_center[1])**2
+#     mask = (x - cx) ** 2 + (y - cy) ** 2 <= circle_radius**2
 
-    mask = dist_sq <= circle_radius**2
+#     mask = xr.DataArray(
+#         mask,
+#         dims=("y", "x"),
+#         coords={"y": img.coords["y"], "x": img.coords["x"]},
+#     )
 
-    masked_img = img.copy()
-    masked_img[~mask] = img.min()
+#     return img.where(mask, other=img.min())
 
-    return masked_img
+def mask_outside_circle(img, circle_center=None, circle_radius=None):
+    height, width = img.shape[-2:]
+
+    if circle_center is None:
+        circle_center = (width / 2, height / 2)
+
+    if circle_radius is None:
+        circle_radius = min(width, height) / 2
+
+    cx, cy = circle_center
+    y, x = np.ogrid[:height, :width]
+
+    mask = (x - cx)**2 + (y - cy)**2 <= circle_radius**2
+
+    return np.where(mask, img, np.min(img))
 
 
-def segment_single_img(img: np.ndarray, scale: int = 4, crop=True, cellpose_model='cyto2'):
-    model = Cellpose(model_type = cellpose_model, gpu=False)
+def segment_single_img(img: np.ndarray, scale: int = 4, crop=True, cellpose_model='cyto2', circle_center=(512, 512), circle_radius=100):
+    model = _new_cellpose_model(cellpose_model)
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
     if crop:
-        img = mask_outside_circle(img)
+        img = mask_outside_circle(img, circle_center=circle_center, circle_radius=circle_radius)
     seg_imgs = rescale(img, 1 / scale, anti_aliasing=True)
     seg_imgs = (seg_imgs - seg_imgs.min()) / (seg_imgs.max() - seg_imgs.min())
     
@@ -175,7 +192,7 @@ def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float
     t_start = perf_counter()
     t0 = perf_counter()
 
-    model = Cellpose(model_type = cellpose_model, gpu=False)
+    model = _new_cellpose_model(cellpose_model)
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
