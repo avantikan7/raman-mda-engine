@@ -30,8 +30,13 @@ class RamanTiffAndNumpyWriter(SimpleMultiFileTiffWriter):
         self,
         save_dir: str | Path,
         core: CMMCorePlus = None,
+        wavenumbers: np.ndarray | None = None,
     ):
         super().__init__(save_dir, core)
+        self._wavenumbers = (
+            None if wavenumbers is None
+            else np.asarray(wavenumbers, dtype=float)
+        )
         if isinstance(self._core.mda.engine, RamanEngine):
             self._core.mda.engine.raman_events.ramanSpectraReady.connect(
                 self._save_raman
@@ -94,3 +99,5 @@ class RamanTiffAndNumpyWriter(SimpleMultiFileTiffWriter):
         self._aiming_path = self._path / "aiming"
         self._raman_path.mkdir()
         self._aiming_path.mkdir()
+        if self._wavenumbers is not None:
+            np.save(self._raman_path / "wavenumbers.npy", self._wavenumbers)
