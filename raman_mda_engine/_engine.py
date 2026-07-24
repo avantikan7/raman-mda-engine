@@ -457,7 +457,11 @@ class RamanEngine(MDAEngine):
             # if ("autofocus" in source.name.lower()) and (self._autofocus_object in ['glass', 'quartz']):
             if "autofocus" in source.name.lower():
                 continue
-            update_pos_points(pos, new_pts[which == source.name], source._points)
+            source_points = new_pts[which == source.name]
+            if hasattr(source, "set_mda_points"):
+                source.set_mda_points(pos, source_points)
+            else:
+                update_pos_points(pos, source_points, source._points)
             return
     def reload(self, N=100):
         n = 0.1  # starting sleep time

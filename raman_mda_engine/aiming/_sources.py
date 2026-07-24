@@ -19,6 +19,7 @@ __all__ = [
     "SnappableRamanAimingSource",
     "RamanAimingSource",
     "SimpleGridSource",
+    "FixedPointsSource",
     "PointsLayerSource",
     "ShapesLayerSource",
 ]
@@ -113,6 +114,56 @@ class SimpleGridSource(BaseSource):
 
     def get_mda_points(self, event: MDAEvent = None) -> np.ndarray:
         return self._grid
+
+
+class FixedPointsSource(BaseSource):
+    """Return the same small set of image-space points at every MDA position."""
+
+    def __init__(
+        self,
+        points: np.ndarray,
+        name: str = None,
+        img_shape: tuple[int, int] = None,
+        transformer: Transformer = None,
+    ) -> None:
+        points = np.atleast_2d(np.asarray(points, dtype=float))
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("points must have shape (N, 2)")
+        self._base_points = points.copy()
+        self._position_points: dict[int, np.ndarray] = {}
+        if img_shape is None:
+            core = CMMCorePlus.instance()
+            self._img_shape = core.getImageWidth(), core.getImageHeight()
+        else:
+            self._img_shape = img_shape
+        if name is None:
+            name = f"fixed-points-{uuid.uuid1()}"
+        super().__init__(name, transformer=transformer)
+
+    def _relative_points(self, points: np.ndarray, transform: bool) -> np.ndarray:
+        relative = points.copy()
+        relative[:, 0] /= self._img_shape[0]
+        relative[:, 1] /= self._img_shape[1]
+        if transform:
+            return self.transformer.transform(relative)
+        return relative
+
+    def get_current_points(self, transform: bool = True) -> np.ndarray:
+        return self._relative_points(self._base_points, transform)
+
+    def get_mda_points(
+        self, event: MDAEvent = None, transform: bool = True
+    ) -> np.ndarray:
+        position = 0 if event is None else event.index.get("p", 0)
+        points = self._position_points.get(position, self._base_points)
+        return self._relative_points(points, transform)
+
+    def set_mda_points(self, position: int, points: np.ndarray) -> None:
+        """Store tracked image-space points for one position only."""
+        points = np.atleast_2d(np.asarray(points, dtype=float))
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("points must have shape (N, 2)")
+        self._position_points[int(position)] = points.copy()
 
 
 class PointsLayerSource(BaseSource):
