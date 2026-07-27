@@ -53,6 +53,7 @@ class RamanEngine(MDAEngine):
         max_volt=1.6,
         sources: list[RamanAimingSource] = None,
         batch=False,
+        pre_acq=True,
         autofocus=True,
         autofocus_p=np.array([0]),
         autofocus_object='quartz',
@@ -89,6 +90,11 @@ class RamanEngine(MDAEngine):
             If None use the default - or nothign if not importable
         sources : iterable
             Collection of aiming sources to aim the raman laser.
+        pre_acq : bool
+            Whether to take a discarded two-frame Raman acquisition before the
+            real acquisition. This helps preposition the galvo for arbitrary
+            aiming points, but can be disabled when every point is already at
+            the center of the field of view.
         segment_channel : str
             Channel config to use when snapping the image to segment/track.
         shutter_device : str or None
@@ -124,6 +130,7 @@ class RamanEngine(MDAEngine):
         self._transformer = transformer
         self._daq = spectra_collector.daq
         self._batch = batch
+        self._pre_acq = bool(pre_acq)
         self._autofocus = autofocus
         self._autofocus_object = autofocus_object
         self._autofocus_p = autofocus_p
@@ -150,7 +157,7 @@ class RamanEngine(MDAEngine):
         self._image_y = image_y
         self._config_file = config_file
         self._circle_center = circle_center
-        self._cricle_radius = circle_radius
+        self._circle_radius = circle_radius
         if self._spectra_collector is None:
             try:
                 from raman_control import SpectraCollector
@@ -226,17 +233,21 @@ class RamanEngine(MDAEngine):
             self._mmc.setState(self._FILTER_DEVICE, desired)
             self._mmc.waitForDevice(self._FILTER_DEVICE)
 
-    def record_raman(self, event: MDAEvent):
+    def record_raman(self, event: MDAEvent, pre_acq: bool = True):
         """
         Record and save the raman spectra for the current position and time.
         Parameters
         ----------
         event : MDAEvent
                 From the mda sequence.
+        pre_acq : bool
+            Whether to take a discarded acquisition to avoid a galvo movement
+            artifact before collecting the real spectra.
         Returns
         -------
         spec : (N, 1340) array of float
         """
+        st = time.perf_counter()
         def shrink_mask(pts):
             x_min = np.min(pts[:, 0])
             x_max = np.max(pts[:, 0])
@@ -288,14 +299,18 @@ class RamanEngine(MDAEngine):
                 points.append(new_points) # must be inside the loop
                 which.extend([source.name] * len(new_points))
         points = np.vstack(points)
-
+        print(f"Before RM channel took {time.perf_counter() - st} s")
+        st = time.perf_counter()
         # spec = self._spectra_collector.collect_spectra_relative(
         #     points, self._default_rm_exp
         # )
         # self._mmc.setConfig(event.channel.group, "RM")
         self.try_set_config(self._channel_group_for_event(event), "RM")
+        print(f"Setting RM channel took {time.perf_counter() - st} s")
+        st = time.perf_counter()
         volts = self._transformer.BF_to_volts((points*[self._image_x, self._image_y])[:, :]/[self._image_y, self._image_x], max_volts = self._max_volt)
-        _ = self._spectra_collector.collect_spectra_pts(np.tile(volts[0], (2, 1)), 100)
+        if pre_acq:
+            _ = self._spectra_collector.collect_spectra_pts(np.tile(volts[0], (2, 1)), 100)
         if not self._batch:
             spec = self._spectra_collector.collect_spectra_pts(
                 volts, self._default_rm_exp
@@ -304,6 +319,8 @@ class RamanEngine(MDAEngine):
             spec = self._spectra_collector.collect_spectra_pts_batch(
                 volts, self._default_rm_exp
             )
+        print(f"Collecting Raman took {time.perf_counter() - st} s")
+        st = time.perf_counter()
         self.raman_events.ramanSpectraReady.emit(event, spec, points, which, self._default_rm_exp)
     @slack_notify
     def snap_raman(
@@ -352,13 +369,14 @@ class RamanEngine(MDAEngine):
     @slack_notify
     def setup_sequence(self, sequence: MDASequence) -> None:
         super().setup_sequence(sequence)
+        self._rm_meta = None
         raman_meta = sequence.metadata.get("raman", None)
         if raman_meta:
             if self._spectra_collector is None:
                 raise RuntimeError("Spectra Collector not set - cannot collect Raman.")
             if len(self.aiming_sources) == 0:
                 raise RuntimeError("No aiming sources - cannot collect Raman.")
-            self._rm_channel = raman_meta.get("channel", "BF")
+            self._rm_channel = raman_meta.get("channel", "RM")
             z = raman_meta.get("z", "all")
             z_index = self._sequence_axis_order(sequence).index("z")
             if isinstance(z, str):
@@ -875,12 +893,17 @@ class RamanEngine(MDAEngine):
 
 
     def setup_event(self, event: MDAEvent) -> None:
+        st = time.perf_counter()
         if event.x_pos is not None or event.y_pos is not None or event.z_pos is not None:
             x = event.x_pos if event.x_pos is not None else self._mmc.getXPosition()
             y = event.y_pos if event.y_pos is not None else self._mmc.getYPosition()
             self.try_set_XYPosition(x, y)
+        print(f"setting the xy pos took {time.perf_counter() - st} s")
+        st = time.perf_counter()
         if event.channel is not None:
             self.try_set_config(event.channel.group, event.channel.config)
+        print(f"setting the channel took {time.perf_counter() - st} s")
+        st = time.perf_counter()
         if self._autofocus or self._segment_and_track:
             pos = event.index.get("p", 0)
             t = event.index.get("t", 0)
@@ -955,37 +978,35 @@ class RamanEngine(MDAEngine):
             self.try_set_ZPosition(event.z_pos)
         if event.exposure is not None:
             self._mmc.setExposure(event.exposure)
-
+        print(f"setting the z pos took {time.perf_counter() - st} s")
+        st = time.perf_counter()
     def exec_event(self, event: MDAEvent) -> Any:
-        channel = event.channel
-        if self._rm_meta:
-            if event.channel.config == self._rm_channel and event.index["z"] in self._rm_z:
-                # self.try_setShutter("Fluoshutter", True)
-                
-                self.record_raman(event)
-                # if shutter:
-                    # self.try_setShutter(shutter, False)
-                self.try_set_config(self._channel_group_for_event(event), "BF")
+        is_raman_event = bool(
+            self._rm_meta
+            and (
+                event.channel is None
+                or event.channel.config == self._rm_channel
+            )
+        )
+        if is_raman_event:
+            if event.index.get("z", 0) in self._rm_z:
+                st = time.perf_counter()
+                self.record_raman(event, pre_acq=self._pre_acq)
+                print(f"record raman took {time.perf_counter() - st} s")
+            # Raman is a detector-only event. The spectra-ready signal carries
+            # its output; no camera snap or ImagePayload is produced.
+            return
+
         if self._skip_imaging_for_same_pos:
             if event.index["p"] in self._image_p:
                 self.try_snap_image()
-                if (
-                    (event.index["z"] == len(self._z_rel)-1)
-                    and (event.channel.config != "BF")
-                ):
-                    self.try_set_config(channel.group, "BF")
 
                 meta = self.get_frame_metadata(event)
                 image = self.try_get_image()
                 yield ImagePayload(image=image, event=event, metadata=meta)
         else:
             self.try_snap_image()
-            if (
-                (event.index["z"] == len(self._z_rel)-1)
-                and (event.channel.config != "BF")
-            ):
-                self.try_set_config(channel.group, "BF")
-            
+
             meta = self.get_frame_metadata(event)
             image = self.try_get_image()
             yield ImagePayload(image=image, event=event, metadata=meta)
