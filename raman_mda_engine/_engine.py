@@ -65,7 +65,6 @@ class RamanEngine(MDAEngine):
         cellpose_model='cyto2',
         tracking_config='particle_config.json',
         scale = 2,
-        raman_glass_offset = 0.5,
         skip_imaging_for_same_pos = False,
         autofocus_search_range=60,
         search_pts=20,
@@ -148,7 +147,6 @@ class RamanEngine(MDAEngine):
         self._cellpose_model = cellpose_model
         self._tracking_config = tracking_config
         self._scale = scale
-        self._raman_glass_offset = raman_glass_offset
         self._skip_imaging_for_same_pos = skip_imaging_for_same_pos
         self._last_operation_reloaded = False
         self._autofocus_search_range = autofocus_search_range
@@ -218,6 +216,16 @@ class RamanEngine(MDAEngine):
         if event.channel is not None:
             return event.channel.group
         return self._mmc.getChannelGroup() or "Channel"
+
+    def _channel_offset_for_event(self, event: MDAEvent) -> float:
+        """Return the configured Z offset for this event's channel."""
+        if event.channel is not None:
+            channel = event.channel.config
+        elif self._rm_meta:
+            channel = self._rm_channel
+        else:
+            return 0.0
+        return self._channel_z_offsets.get(channel, 0.0)
 
     def _set_focus_filter(self, inserted: bool) -> None:
         """Control port0/line1 through Micro-Manager's port-wide DigitalIO device."""
@@ -376,6 +384,15 @@ class RamanEngine(MDAEngine):
     @slack_notify
     def setup_sequence(self, sequence: MDASequence) -> None:
         super().setup_sequence(sequence)
+        raw_offsets = sequence.metadata.get("channel_z_offsets_um", {})
+        if not isinstance(raw_offsets, dict):
+            raise ValueError("channel_z_offsets_um metadata must be a mapping")
+        self._channel_z_offsets = {
+            str(channel): float(offset)
+            for channel, offset in raw_offsets.items()
+        }
+        if not all(np.isfinite(offset) for offset in self._channel_z_offsets.values()):
+            raise ValueError("Channel Z offsets must be finite")
         self._rm_meta = None
         raman_meta = sequence.metadata.get("raman", None)
         if raman_meta:
@@ -851,8 +868,9 @@ class RamanEngine(MDAEngine):
                 # max_laser_offset = x_peak
                 # print(focusZ + x_fine[np.argmin(np.abs(y_fine_glass - 0.5))])
                 # popt, _ = curve_fit(normalized︃_tanh, coarse_Z, cell_raman, p0=[0, 2], method='trf')
-                # max_laser_offset = popt[0]-self._raman_glass_offset # 2 is the default offset between rm cell and rm glass, change accordingly
-                max_laser_offset = x_fine[np.argmin(np.abs(y_fine_glass - 0.5))] - self._raman_glass_offset
+                max_laser_offset = x_fine[
+                    np.argmin(np.abs(y_fine_glass - 0.5))
+                ]
         elif object == 'software':
             coarse_Z = np.linspace(-search_range, search_range, search_pts)
             figs = []
@@ -876,7 +894,7 @@ class RamanEngine(MDAEngine):
             max_index = np.argmax(y_fine)
             x_peak = x_fine[max_index]
             # y_peak = y_fine[max_index]
-            max_laser_offset = x_peak - self._raman_glass_offset
+            max_laser_offset = x_peak
             coarse_raman = None
         elif object == 'laser':
             # --- coarse laser scan: uses class-level search_pts ---
@@ -943,7 +961,11 @@ class RamanEngine(MDAEngine):
                 # np.save(f'debug2/figs_{t}_{p}.npy', figs)
                 # np.save(f'debug2/zs_{t}_{p}.npy', fine_Z + coarse_max)
                 scores = figs.sum(axis=1)
-                max_laser_offset = fine_Z[np.argmax(np.max(scores, axis=1))] - focusZ + coarse_max - self._raman_glass_offset
+                max_laser_offset = (
+                    fine_Z[np.argmax(np.max(scores, axis=1))]
+                    - focusZ
+                    + coarse_max
+                )
                 coarse_raman = None
             finally:
                 try:
@@ -1004,9 +1026,7 @@ class RamanEngine(MDAEngine):
                     print(f"[baseline z] pos={pos}: {base}")
                     self.try_set_ZPosition(self._last_best_z[pos])
                 else:
-                    self.try_set_ZPosition(
-                        self._last_best_z[pos] + self._raman_glass_offset
-                    )
+                    self.try_set_ZPosition(self._last_best_z[pos])
                 # ---- Step 1: autofocus ----
                 if self._autofocus and do_refocus and pos in self._autofocus_p:
                     points = None
@@ -1022,9 +1042,7 @@ class RamanEngine(MDAEngine):
                     self._last_best_z[pos] = self._bestZ
                 # ---- Step 2: aiming update ----
                 if self._segment_and_track and do_refocus:
-                    self.try_set_ZPosition(
-                        self._last_best_z[pos] + self._raman_glass_offset
-                    )
+                    self.try_set_ZPosition(self._last_best_z[pos])
                     time.sleep(0.5)
                     self.try_set_config(self._channel_group_for_event(event), self._segment_channel)
                     self.try_setExp(10)
@@ -1039,15 +1057,22 @@ class RamanEngine(MDAEngine):
                         use_same = False
                     self.update_aim(pos, event, image, use_same_img=use_same)
                     self.try_set_ZPosition(self._last_best_z[pos])
-            # per-plane z: ALWAYS runs, even when event.z_pos is None,
-            # so the stage can never silently stay at the previous
-            # position's last plane
-            if "z" in event.index:
-                self.try_set_ZPosition(
-                    self._last_best_z[pos] + self._z_rel[event.index["z"]]
-                )
+            # Channel offsets use the same direct convention for camera and
+            # Raman events: focused baseline + relative Z + channel offset.
+            relative_z = (
+                self._z_rel[event.index["z"]]
+                if "z" in event.index
+                else 0.0
+            )
+            self.try_set_ZPosition(
+                self._last_best_z[pos]
+                + relative_z
+                + self._channel_offset_for_event(event)
+            )
         elif event.z_pos is not None:
-            self.try_set_ZPosition(event.z_pos)
+            self.try_set_ZPosition(
+                event.z_pos + self._channel_offset_for_event(event)
+            )
         if event.exposure is not None:
             self._mmc.setExposure(event.exposure)
         # print(f"setting the z pos took {time.perf_counter() - st} s")

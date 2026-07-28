@@ -53,7 +53,6 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
     engine._search_pts = 2
     engine._fine_search_range = 1
     engine._fine_search_pts = 2
-    engine._raman_glass_offset = 0
     engine._shutter_device = None
     engine._max_volt = 1.6
     engine._image_x = 200
@@ -112,6 +111,41 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
         call.set_xy(950.0, 2010.0),
         call.sleep(0.1),
     ]
+
+
+def test_setup_event_adds_offset_for_each_explicit_channel():
+    engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
+    engine._mmc.getXPosition.return_value = 1
+    engine._mmc.getYPosition.return_value = 2
+    engine._autofocus = False
+    engine._segment_and_track = False
+    engine._rm_meta = {"channel": "RM", "z": [0]}
+    engine._rm_channel = "RM"
+    engine._channel_z_offsets = {"GFP": 1.25, "RM": -5.0}
+    engine.try_set_XYPosition = MagicMock()
+    engine.try_set_ZPosition = MagicMock()
+    engine.try_set_config = MagicMock()
+
+    for channel, expected_z in (("GFP", 101.25), ("RM", 95.0)):
+        event = MDAEvent(
+            index={"p": 0, "c": 0, "z": 0},
+            channel={"group": "Channel", "config": channel},
+            z_pos=100,
+        )
+        engine.setup_event(event)
+        assert engine.try_set_ZPosition.call_args == call(expected_z)
+
+
+def test_channel_less_raman_event_uses_raman_channel_offset():
+    engine = object.__new__(RamanEngine)
+    engine._rm_meta = {"channel": "RM", "z": [0]}
+    engine._rm_channel = "RM"
+    engine._channel_z_offsets = {"RM": -4.5}
+
+    event = MDAEvent(index={"p": 0, "z": 0})
+
+    assert engine._channel_offset_for_event(event) == -4.5
 
 
 def test_channel_less_raman_event_has_no_camera_payload():
