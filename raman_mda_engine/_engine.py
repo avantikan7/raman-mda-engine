@@ -76,7 +76,8 @@ class RamanEngine(MDAEngine):
         image_y=1024,
         config_file = None,
         circle_center=(512, 512),
-        circle_radius=100
+        circle_radius=100,
+        stage_centering_model=None,
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -114,6 +115,11 @@ class RamanEngine(MDAEngine):
             X size of the camera image in pixels.
         image_y : int
             Y size of the camera image in pixels.
+        stage_centering_model : tuple[numpy.ndarray, int] or None
+            ``(coefficients, degree)`` for the pixel-offset to stage-offset
+            Vandermonde model. Laser autofocus requires this model so it can
+            move the selected autofocus point to the center of the field of
+            view instead of steering the galvo away from center.
         """
         # MDAEngine uses the core immediately during its initialization (for
         # example, to read the auto-shutter state), so it must never receive
@@ -158,6 +164,7 @@ class RamanEngine(MDAEngine):
         self._config_file = config_file
         self._circle_center = circle_center
         self._circle_radius = circle_radius
+        self._stage_centering_model = stage_centering_model
         if self._spectra_collector is None:
             try:
                 from raman_control import SpectraCollector
@@ -299,15 +306,15 @@ class RamanEngine(MDAEngine):
                 points.append(new_points) # must be inside the loop
                 which.extend([source.name] * len(new_points))
         points = np.vstack(points)
-        print(f"Before RM channel took {time.perf_counter() - st} s")
-        st = time.perf_counter()
+        # print(f"Before RM channel took {time.perf_counter() - st} s")
+        # st = time.perf_counter()
         # spec = self._spectra_collector.collect_spectra_relative(
         #     points, self._default_rm_exp
         # )
         # self._mmc.setConfig(event.channel.group, "RM")
         self.try_set_config(self._channel_group_for_event(event), "RM")
-        print(f"Setting RM channel took {time.perf_counter() - st} s")
-        st = time.perf_counter()
+        # print(f"Setting RM channel took {time.perf_counter() - st} s")
+        # st = time.perf_counter()
         volts = self._transformer.BF_to_volts((points*[self._image_x, self._image_y])[:, :]/[self._image_y, self._image_x], max_volts = self._max_volt)
         if pre_acq:
             _ = self._spectra_collector.collect_spectra_pts(np.tile(volts[0], (2, 1)), 100)
@@ -319,8 +326,8 @@ class RamanEngine(MDAEngine):
             spec = self._spectra_collector.collect_spectra_pts_batch(
                 volts, self._default_rm_exp
             )
-        print(f"Collecting Raman took {time.perf_counter() - st} s")
-        st = time.perf_counter()
+        # print(f"Collecting Raman took {time.perf_counter() - st} s")
+        # st = time.perf_counter()
         self.raman_events.ramanSpectraReady.emit(event, spec, points, which, self._default_rm_exp)
     @slack_notify
     def snap_raman(
@@ -722,6 +729,48 @@ class RamanEngine(MDAEngine):
         best_index = int(np.argmax(scores))
         return best_index, scores
 
+    def _laser_autofocus_stage_positions(self, pt):
+        """Return the original and target XY for center-point autofocus."""
+        if self._stage_centering_model is None:
+            raise RuntimeError(
+                "Laser autofocus requires a pixel-to-stage Vandermonde model"
+            )
+
+        coefficients, degree = self._stage_centering_model
+        coefficients = np.asarray(coefficients, dtype=float)
+        degree = int(degree)
+
+        # Aiming sources use the historical normalized (y, x) convention:
+        # multiplying by (image_x, image_y) recovers the raw image pixel.
+        point_yx = np.asarray(pt, dtype=float).reshape(2) * np.array(
+            [self._image_x, self._image_y], dtype=float
+        )
+        center_yx = np.array(
+            [self._image_y / 2.0, self._image_x / 2.0], dtype=float
+        )
+        offset_yx = point_yx - center_yx
+        offset_xy = offset_yx[::-1]
+
+        x_offset, y_offset = offset_xy
+        terms = []
+        for total_degree in range(degree + 1):
+            for x_degree in range(total_degree + 1):
+                y_degree = total_degree - x_degree
+                terms.append(
+                    (x_offset**x_degree) * (y_offset**y_degree)
+                )
+        stage_offset = np.asarray(terms, dtype=float) @ coefficients
+        if stage_offset.shape != (2,) or not np.all(np.isfinite(stage_offset)):
+            raise ValueError(
+                "Pixel-to-stage model must produce one finite (dX, dY) pair"
+            )
+
+        original_xy = np.asarray(self.try_get_XYPosition(), dtype=float)
+        if original_xy.shape != (2,) or not np.all(np.isfinite(original_xy)):
+            raise RuntimeError("Could not read the current XY stage position")
+        target_xy = original_xy - stage_offset
+        return tuple(original_xy), tuple(target_xy)
+
     def autofocus_w_raman(self, last_z, pt, t, p, max_volt=1.6):
         focusZ = self.try_get_ZPosition()
         object = self._autofocus_object
@@ -832,16 +881,32 @@ class RamanEngine(MDAEngine):
         elif object == 'laser':
             # --- coarse laser scan: uses class-level search_pts ---
 
-            volts = self._transformer.BF_to_volts((pt.reshape(1, -1)*[self._image_x, self._image_y])/[self._image_y, self._image_x], max_volts=self._max_volt)
-            # _ = self._spectra_collector.collect_spectra_pts(np.array([volts[0], volts[0]]), 100)
-            coarse_Z = np.linspace(-search_range, search_range, search_pts)
-            figs = []
-            something_broke = 0
-
-            self._laser_autofocus_active = True
-            self._mmc.setAutoShutter(False)
-            self._mmc.setShutterOpen(True)
+            # Keep the galvo at the calibrated image center. Move the XY stage
+            # temporarily so the selected autofocus point is under that fixed
+            # laser location, avoiding off-axis galvo-steering artifacts.
+            volts = self._transformer.BF_to_volts(
+                np.array([[0.5, 0.5]]),
+                max_volts=self._max_volt,
+            )
+            original_xy, autofocus_xy = (
+                self._laser_autofocus_stage_positions(pt)
+            )
+            print(
+                "[laser autofocus] centering with stage: "
+                f"XY {original_xy} -> {autofocus_xy}"
+            )
             try:
+                self.try_set_XYPosition(*autofocus_xy)
+                time.sleep(0.1)
+                coarse_Z = np.linspace(
+                    -search_range, search_range, search_pts
+                )
+                figs = []
+                something_broke = 0
+
+                self._laser_autofocus_active = True
+                self._mmc.setAutoShutter(False)
+                self._mmc.setShutterOpen(True)
                 # try_set_config writes RM=1, then adds the filter bit,
                 # producing port state 3.
                 self.try_set_config("Channel", "RM")
@@ -881,11 +946,18 @@ class RamanEngine(MDAEngine):
                 max_laser_offset = fine_Z[np.argmax(np.max(scores, axis=1))] - focusZ + coarse_max - self._raman_glass_offset
                 coarse_raman = None
             finally:
-                self._laser_autofocus_active = False
-                # Converts RM+filter (3) back to ordinary RM (1).
-                self._set_focus_filter(False)
-                self._mmc.setAutoShutter(True)
-                self._mmc.setShutterOpen(False)
+                try:
+                    self._laser_autofocus_active = False
+                    # Converts RM+filter (3) back to ordinary RM (1).
+                    self._set_focus_filter(False)
+                    self._mmc.setAutoShutter(True)
+                    self._mmc.setShutterOpen(False)
+                finally:
+                    self.try_set_XYPosition(*original_xy)
+                    print(
+                        "[laser autofocus] restored stage XY to "
+                        f"{original_xy}"
+                    )
         # self.try_setShutter("Fluoshutter", False)
         if np.abs(max_laser_offset) >= 3*search_range or something_broke != 0:
             return focusZ, last_z, coarse_raman
@@ -893,17 +965,17 @@ class RamanEngine(MDAEngine):
 
 
     def setup_event(self, event: MDAEvent) -> None:
-        st = time.perf_counter()
+        # st = time.perf_counter()
         if event.x_pos is not None or event.y_pos is not None or event.z_pos is not None:
             x = event.x_pos if event.x_pos is not None else self._mmc.getXPosition()
             y = event.y_pos if event.y_pos is not None else self._mmc.getYPosition()
             self.try_set_XYPosition(x, y)
-        print(f"setting the xy pos took {time.perf_counter() - st} s")
-        st = time.perf_counter()
+        # print(f"setting the xy pos took {time.perf_counter() - st} s")
+        # st = time.perf_counter()
         if event.channel is not None:
             self.try_set_config(event.channel.group, event.channel.config)
-        print(f"setting the channel took {time.perf_counter() - st} s")
-        st = time.perf_counter()
+        # print(f"setting the channel took {time.perf_counter() - st} s")
+        # st = time.perf_counter()
         if self._autofocus or self._segment_and_track:
             pos = event.index.get("p", 0)
             t = event.index.get("t", 0)
@@ -978,8 +1050,8 @@ class RamanEngine(MDAEngine):
             self.try_set_ZPosition(event.z_pos)
         if event.exposure is not None:
             self._mmc.setExposure(event.exposure)
-        print(f"setting the z pos took {time.perf_counter() - st} s")
-        st = time.perf_counter()
+        # print(f"setting the z pos took {time.perf_counter() - st} s")
+        # st = time.perf_counter()
     def exec_event(self, event: MDAEvent) -> Any:
         is_raman_event = bool(
             self._rm_meta
@@ -990,9 +1062,9 @@ class RamanEngine(MDAEngine):
         )
         if is_raman_event:
             if event.index.get("z", 0) in self._rm_z:
-                st = time.perf_counter()
+                # st = time.perf_counter()
                 self.record_raman(event, pre_acq=self._pre_acq)
-                print(f"record raman took {time.perf_counter() - st} s")
+                # print(f"record raman took {time.perf_counter() - st} s")
             # Raman is a detector-only event. The spectra-ready signal carries
             # its output; no camera snap or ImagePayload is produced.
             return

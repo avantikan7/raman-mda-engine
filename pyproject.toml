@@ -8,7 +8,7 @@ name = "raman-mda-engine"
 description = "pymmcore-plus mda engine for running spontaneous raman experiments."
 keywords = ["microscope", "micro-manager", "raman", "multi-processing", "pymmcore-plus"]
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "BSD 3-Clause License" }
 authors = [
     { name = "Ian Hunt-Isaak", email = "ianhuntisaak@gmail.com"},
@@ -23,8 +23,6 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Topic :: System :: Hardware",
@@ -33,12 +31,16 @@ classifiers = [
 ]
 
 dependencies = [
+    "h5py",
     "mda-simulator",
     "napari-broadcastable-points>=0.2.0",
+    "ome-writers[tifffile]>=0.3.2",
     "pymmcore-mda-writers",
     "pymmcore-plus>=0.4.0",
-    "shapely",
     "qtpy",
+    "shapely",
+    "tifffile>=2024.8.30,<2025",
+    "useq-schema>=0.9.2",
     "wrapt",
 ]
 
