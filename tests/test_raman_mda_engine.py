@@ -123,6 +123,7 @@ def test_setup_event_adds_offset_for_each_explicit_channel():
     engine._rm_meta = {"channel": "RM", "z": [0]}
     engine._rm_channel = "RM"
     engine._channel_z_offsets = {"GFP": 1.25, "RM": -5.0}
+    engine._autoshutter_was_set = False
     engine.try_set_XYPosition = MagicMock()
     engine.try_set_ZPosition = MagicMock()
     engine.try_set_config = MagicMock()
@@ -135,6 +136,60 @@ def test_setup_event_adds_offset_for_each_explicit_channel():
         )
         engine.setup_event(event)
         assert engine.try_set_ZPosition.call_args == call(expected_z)
+
+
+def test_setup_event_holds_shutter_open_when_requested():
+    engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
+    engine._mmc.getAutoShutter.return_value = True
+    engine._autoshutter_was_set = True
+    engine._autofocus = False
+    engine._segment_and_track = False
+    engine._channel_z_offsets = {}
+
+    engine.setup_event(MDAEvent(keep_shutter_open=True))
+
+    engine._mmc.setAutoShutter.assert_called_once_with(False)
+    engine._mmc.setShutterOpen.assert_called_once_with(True)
+    engine._mmc.waitForSystem.assert_called_once_with()
+
+
+def test_teardown_sequence_closes_shutter_and_restores_autoshutter():
+    engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
+    engine._autoshutter_was_set = True
+
+    engine.teardown_sequence(MDASequence())
+
+    engine._mmc.setShutterOpen.assert_called_once_with(False)
+    engine._mmc.setAutoShutter.assert_called_once_with(True)
+    engine._mmc.waitForSystem.assert_called_once_with()
+
+
+def test_cpzt_can_hold_shutter_across_positions_z_and_time():
+    sequence = MDASequence(
+        axis_order="cpzt",
+        channels=("BF", "GFP"),
+        stage_positions=((0, 0), (1, 1)),
+        z_plan={"relative": (0, 1)},
+        time_plan={"interval": 0, "loops": 2},
+        keep_shutter_open_across=("p", "z", "t"),
+    )
+    events = tuple(sequence.iter_events())
+
+    position_transition = next(
+        event
+        for event in events
+        if event.index == {"c": 0, "p": 0, "z": 1, "t": 1}
+    )
+    channel_transition = next(
+        event
+        for event in events
+        if event.index == {"c": 0, "p": 1, "z": 1, "t": 1}
+    )
+
+    assert position_transition.keep_shutter_open
+    assert not channel_transition.keep_shutter_open
 
 
 def test_channel_less_raman_event_uses_raman_channel_offset():
@@ -157,6 +212,7 @@ def test_channel_less_raman_event_has_no_camera_payload():
     engine._rm_z = np.array([0])
     engine._pre_acq = False
     engine._skip_imaging_for_same_pos = False
+    engine._autoshutter_was_set = False
     engine._z_rel = [0]
     engine.record_raman = MagicMock()
     engine.try_snap_image = MagicMock()
@@ -178,6 +234,7 @@ def test_explicit_raman_channel_has_no_camera_payload():
     engine._rm_z = np.array([0])
     engine._pre_acq = False
     engine._skip_imaging_for_same_pos = False
+    engine._autoshutter_was_set = False
     engine.record_raman = MagicMock()
     engine.try_snap_image = MagicMock()
     event = MDAEvent(
@@ -198,6 +255,8 @@ def test_camera_channel_does_not_force_brightfield():
     engine._rm_channel = "RM"
     engine._rm_z = np.array([0])
     engine._skip_imaging_for_same_pos = False
+    engine._autoshutter_was_set = True
+    engine._mmc = MagicMock()
     engine.try_snap_image = MagicMock()
     engine.try_set_config = MagicMock()
     engine.get_frame_metadata = MagicMock(return_value={})
@@ -211,6 +270,7 @@ def test_camera_channel_does_not_force_brightfield():
 
     engine.try_snap_image.assert_called_once_with()
     engine.try_set_config.assert_not_called()
+    engine._mmc.setShutterOpen.assert_called_once_with(False)
     assert len(payloads) == 1
 
 

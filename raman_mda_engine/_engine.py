@@ -227,6 +227,23 @@ class RamanEngine(MDAEngine):
             return 0.0
         return self._channel_z_offsets.get(channel, 0.0)
 
+    def _prepare_shutter_for_event(self, event: MDAEvent) -> None:
+        """Hold the configured shutter open when the next event permits it."""
+        if (
+            self._autoshutter_was_set
+            and event.keep_shutter_open
+            and self._mmc.getAutoShutter()
+        ):
+            self._mmc.setAutoShutter(False)
+            self._mmc.setShutterOpen(True)
+            self._mmc.waitForSystem()
+
+    def _finish_shutter_for_event(self, event: MDAEvent) -> None:
+        """Close a shutter previously managed through automatic shutter mode."""
+        if self._autoshutter_was_set and not event.keep_shutter_open:
+            self._mmc.setShutterOpen(False)
+            self._mmc.waitForSystem()
+
     def _set_focus_filter(self, inserted: bool) -> None:
         """Control port0/line1 through Micro-Manager's port-wide DigitalIO device."""
         if self._FILTER_DEVICE not in self._mmc.getLoadedDevices():
@@ -1075,9 +1092,16 @@ class RamanEngine(MDAEngine):
             )
         if event.exposure is not None:
             self._mmc.setExposure(event.exposure)
+        self._prepare_shutter_for_event(event)
         # print(f"setting the z pos took {time.perf_counter() - st} s")
         # st = time.perf_counter()
     def exec_event(self, event: MDAEvent) -> Any:
+        try:
+            yield from self._exec_event(event)
+        finally:
+            self._finish_shutter_for_event(event)
+
+    def _exec_event(self, event: MDAEvent) -> Any:
         is_raman_event = bool(
             self._rm_meta
             and (
@@ -1107,4 +1131,13 @@ class RamanEngine(MDAEngine):
             meta = self.get_frame_metadata(event)
             image = self.try_get_image()
             yield ImagePayload(image=image, event=event, metadata=meta)
-        
+
+    def teardown_sequence(self, sequence: MDASequence) -> None:
+        """Restore automatic shutter mode after completion or cancellation."""
+        try:
+            if self._autoshutter_was_set:
+                self._mmc.setShutterOpen(False)
+                self._mmc.setAutoShutter(True)
+                self._mmc.waitForSystem()
+        finally:
+            super().teardown_sequence(sequence)
