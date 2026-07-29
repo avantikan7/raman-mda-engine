@@ -70,6 +70,7 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
         (2, 8)
     )
     engine._mmc = MagicMock()
+    engine._mmc.getCurrentConfig.return_value = "BF"
     engine.try_get_ZPosition = MagicMock(return_value=10)
     engine.try_get_XYPosition = MagicMock(return_value=(1000, 2000))
     stage_settling = MagicMock()
@@ -110,6 +111,18 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
     assert stage_settling.mock_calls[:2] == [
         call.set_xy(950.0, 2010.0),
         call.sleep(0.1),
+    ]
+    assert engine.try_set_config.call_args_list == [
+        call("Channel", "RM"),
+        call("Channel", "BF"),
+    ]
+    assert engine._mmc.setShutterOpen.call_args_list == [
+        call(True),
+        call(False),
+    ]
+    assert engine._mmc.setAutoShutter.call_args_list == [
+        call(False),
+        call(True),
     ]
 
 

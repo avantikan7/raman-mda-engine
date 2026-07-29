@@ -919,6 +919,14 @@ class RamanEngine(MDAEngine):
             # Keep the galvo at the calibrated image center. Move the XY stage
             # temporarily so the selected autofocus point is under that fixed
             # laser location, avoiding off-axis galvo-steering artifacts.
+            try:
+                return_channel = (
+                    self._mmc.getCurrentConfig("Channel")
+                    or self._segment_channel
+                    or "BF"
+                )
+            except (AttributeError, RuntimeError):
+                return_channel = self._segment_channel or "BF"
             volts = self._transformer.BF_to_volts(
                 np.array([[0.5, 0.5]]),
                 max_volts=self._max_volt,
@@ -987,10 +995,17 @@ class RamanEngine(MDAEngine):
             finally:
                 try:
                     self._laser_autofocus_active = False
-                    # Converts RM+filter (3) back to ordinary RM (1).
-                    self._set_focus_filter(False)
-                    self._mmc.setAutoShutter(True)
+                    # Close the shutter while it is still under manual control,
+                    # then restore the imaging preset that was active before
+                    # autofocus.  Merely removing the focus filter leaves the
+                    # DigitalIO port in RM state (laser on), which contaminates
+                    # the next frame used for cell segmentation.
                     self._mmc.setShutterOpen(False)
+                    self._set_focus_filter(False)
+                    if return_channel:
+                        self.try_set_config("Channel", return_channel)
+                    self._mmc.setAutoShutter(True)
+                    self._mmc.waitForSystem()
                 finally:
                     self.try_set_XYPosition(*original_xy)
                     print(
