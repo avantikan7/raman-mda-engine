@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,23 @@ def _unique_folder(folder_base_name: str | Path) -> Path:
             path.mkdir(parents=True)
             return path
         index += 1
+
+
+def _overwrite_folder(folder_name: str | Path) -> Path:
+    """Replace an existing acquisition folder and return its resolved path."""
+    folder = Path(folder_name).expanduser().resolve()
+    if folder.parent == folder:
+        raise ValueError("Refusing to overwrite a filesystem root")
+    if folder.is_symlink():
+        raise ValueError("Refusing to overwrite a symbolic link")
+    if folder.exists():
+        if not folder.is_dir():
+            raise NotADirectoryError(
+                f"Writer output path is not a directory: {folder}"
+            )
+        shutil.rmtree(folder)
+    folder.mkdir(parents=True)
+    return folder
 
 
 def _as_spectra(data: np.ndarray) -> np.ndarray:
@@ -294,6 +312,7 @@ class RamanAcquisitionWriter:
         *,
         image_positions: Iterable[int] | None = None,
         batch: bool = False,
+        overwrite: bool = False,
     ) -> None:
         from pymmcore_plus import CMMCorePlus
 
@@ -310,6 +329,7 @@ class RamanAcquisitionWriter:
             else tuple(int(value) for value in image_positions)
         )
         self._batch = bool(batch)
+        self._overwrite = bool(overwrite)
         self._path: Path | None = None
         self._sequence: MDASequence | None = None
         self._image_sequence: MDASequence | None = None
@@ -382,7 +402,11 @@ class RamanAcquisitionWriter:
     def _on_mda_started(
         self, sequence: MDASequence, _summary_metadata: dict | None = None
     ) -> None:
-        self._path = _unique_folder(self._save_dir)
+        self._path = (
+            _overwrite_folder(self._save_dir)
+            if self._overwrite
+            else _unique_folder(self._save_dir)
+        )
         self._sequence = sequence
         self._status = "acquiring"
         self._closed = False

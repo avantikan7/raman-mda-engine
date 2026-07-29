@@ -55,8 +55,10 @@ def new_cellpose_model(model="cyto2"):
                 gpu=False,
             )
         if hasattr(models, "Cellpose"):
-            # Cellpose <=3: named models are selected with model_type.
-            return cellpose_model(model_type=str(model), gpu=False)
+            # Preserve the original Cellpose <=3 path for built-in models.
+            # The wrapper owns the ``cp`` inference model used by this project
+            # before custom-model support was added.
+            return models.Cellpose(model_type=str(model), gpu=False)
         # Cellpose >=4: built-in and registered names use pretrained_model.
         return cellpose_model(pretrained_model=str(model), gpu=False)
     except Exception as exc:
@@ -67,5 +69,6 @@ def new_cellpose_model(model="cyto2"):
 
 def eval_cellpose_model(model, image, **kwargs):
     """Evaluate either Cellpose 3 or 4 and return its label mask."""
-    result = model.eval(image, **kwargs)
+    inference_model = getattr(model, "cp", model)
+    result = inference_model.eval(image, **kwargs)
     return result[0] if isinstance(result, tuple) else result

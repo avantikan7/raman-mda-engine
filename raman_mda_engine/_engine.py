@@ -77,6 +77,7 @@ class RamanEngine(MDAEngine):
         circle_center=(512, 512),
         circle_radius=100,
         stage_centering_model=None,
+        cell_diameter=15,
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -119,6 +120,9 @@ class RamanEngine(MDAEngine):
             Vandermonde model. Laser autofocus requires this model so it can
             move the selected autofocus point to the center of the field of
             view instead of steering the galvo away from center.
+        cell_diameter : float or None
+            Expected cell diameter in pixels in the original segmentation
+            image. ``None`` uses the diameter stored with the Cellpose model.
         """
         # MDAEngine uses the core immediately during its initialization (for
         # example, to read the auto-shutter state), so it must never receive
@@ -145,6 +149,7 @@ class RamanEngine(MDAEngine):
         self._shutter_device = shutter_device
         self._segment_crop = segment_crop
         self._cellpose_model = cellpose_model
+        self._cell_diameter = cell_diameter
         self._tracking_config = tracking_config
         self._scale = scale
         self._skip_imaging_for_same_pos = skip_imaging_for_same_pos
@@ -473,7 +478,8 @@ class RamanEngine(MDAEngine):
             crop=self._segment_crop,
             cellpose_model=self._cellpose_model,
             circle_center=self._circle_center,
-            circle_radius=self._circle_radius
+            circle_radius=self._circle_radius,
+            diameter=self._cell_diameter,
         )
         # Decide whether reusing the previous position's mask is even possible.
         can_reuse = (
@@ -927,6 +933,14 @@ class RamanEngine(MDAEngine):
                 )
             except (AttributeError, RuntimeError):
                 return_channel = self._segment_channel or "BF"
+            try:
+                return_exposure = float(self._mmc.getExposure())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                return_exposure = None
+            try:
+                return_auto_shutter = bool(self._mmc.getAutoShutter())
+            except (AttributeError, RuntimeError):
+                return_auto_shutter = True
             volts = self._transformer.BF_to_volts(
                 np.array([[0.5, 0.5]]),
                 max_volts=self._max_volt,
@@ -1004,7 +1018,9 @@ class RamanEngine(MDAEngine):
                     self._set_focus_filter(False)
                     if return_channel:
                         self.try_set_config("Channel", return_channel)
-                    self._mmc.setAutoShutter(True)
+                    if return_exposure is not None:
+                        self.try_setExp(return_exposure)
+                    self._mmc.setAutoShutter(return_auto_shutter)
                     self._mmc.waitForSystem()
                 finally:
                     self.try_set_XYPosition(*original_xy)

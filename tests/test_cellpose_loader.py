@@ -26,10 +26,15 @@ def _fake_cellpose(monkeypatch, *, legacy):
         def __init__(self, **kwargs):
             calls.append(kwargs)
 
+    class Cellpose:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self.cp = CellposeModel()
+
     models = ModuleType("cellpose.models")
     models.CellposeModel = CellposeModel
     if legacy:
-        models.Cellpose = object
+        models.Cellpose = Cellpose
     cellpose = ModuleType("cellpose")
     cellpose.models = models
     monkeypatch.setitem(sys.modules, "cellpose", cellpose)
@@ -48,9 +53,13 @@ def test_cellpose_4_named_model_uses_pretrained_model(monkeypatch):
 def test_cellpose_3_named_model_uses_model_type(monkeypatch):
     calls = _fake_cellpose(monkeypatch, legacy=True)
 
-    _LOADER.new_cellpose_model("cyto2")
+    model = _LOADER.new_cellpose_model("cyto2")
 
-    assert calls == [{"model_type": "cyto2", "gpu": False}]
+    assert hasattr(model, "cp")
+    assert calls == [
+        {"model_type": "cyto2", "gpu": False},
+        {},
+    ]
 
 
 def test_custom_weights_use_resolved_path(monkeypatch, tmp_path):
@@ -80,3 +89,21 @@ def test_eval_uses_cellpose_model_directly():
     assert _LOADER.eval_cellpose_model(
         Model(), "image", diameter=50
     ) == "labels"
+
+
+def test_eval_preserves_legacy_cellpose_cp_path():
+    class InferenceModel:
+        def eval(self, image, **kwargs):
+            assert image == "image"
+            assert kwargs == {"diameter": 50}
+            return "legacy-labels", "flows", "styles"
+
+    class LegacyCellpose:
+        cp = InferenceModel()
+
+        def eval(self, *_args, **_kwargs):
+            raise AssertionError("the wrapper eval path must not be used")
+
+    assert _LOADER.eval_cellpose_model(
+        LegacyCellpose(), "image", diameter=50
+    ) == "legacy-labels"

@@ -47,6 +47,44 @@ def test_image_source_positions_reuses_previous_physical_fov():
     )
 
 
+def test_writer_uses_unique_sibling_by_default(tmp_path):
+    output = tmp_path / "run"
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("existing data", encoding="utf-8")
+    core = _FakeCore()
+    writer = RamanAcquisitionWriter(output, core=core, image_positions=[])
+
+    core.mda.events.sequenceStarted.emit(MDASequence(channels=["BF"]), {})
+
+    assert writer.path == tmp_path / "run_1"
+    assert marker.read_text(encoding="utf-8") == "existing data"
+    writer.close()
+
+
+def test_writer_overwrite_replaces_exact_output_folder(tmp_path):
+    output = tmp_path / "run"
+    stale = output / "old" / "stale.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("old data", encoding="utf-8")
+    core = _FakeCore()
+    writer = RamanAcquisitionWriter(
+        output,
+        core=core,
+        image_positions=[],
+        overwrite=True,
+    )
+
+    core.mda.events.sequenceStarted.emit(MDASequence(channels=["BF"]), {})
+
+    assert writer.path == output.resolve()
+    assert not stale.exists()
+    assert (output / "useq-sequence.json").is_file()
+    assert (output / "images").is_dir()
+    assert (output / "aiming").is_dir()
+    writer.close()
+
+
 def test_raman_h5_store_appends_variable_event_payloads(tmp_path):
     path = tmp_path / "raman.h5"
     store = _RamanH5Store(

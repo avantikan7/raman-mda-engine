@@ -135,22 +135,63 @@ def mask_outside_circle(img, circle_center=None, circle_radius=None):
     return np.where(mask, img, np.min(img))
 
 
-def segment_single_img(img: np.ndarray, scale: int = 4, crop=True, cellpose_model='cyto2', circle_center=(512, 512), circle_radius=100):
+def _normalize_for_cellpose(
+    img,
+    circle_center=None,
+    circle_radius=None,
+):
+    """Percentile-normalize an image without letting hot pixels erase contrast."""
+    image = np.asarray(img, dtype=np.float32)
+    valid = np.isfinite(image)
+
+    if circle_radius is not None:
+        height, width = image.shape[-2:]
+        if circle_center is None:
+            circle_center = (width / 2, height / 2)
+        cx, cy = circle_center
+        y, x = np.ogrid[:height, :width]
+        valid &= (x - cx) ** 2 + (y - cy) ** 2 <= circle_radius**2
+
+    values = image[valid]
+    if values.size == 0:
+        return np.zeros_like(image, dtype=np.float32)
+
+    low, high = np.percentile(values, (1, 99))
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        return np.zeros_like(image, dtype=np.float32)
+
+    normalized = np.clip((image - low) / (high - low), 0, 1)
+    normalized[~valid] = 0
+    return normalized.astype(np.float32, copy=False)
+
+
+def segment_single_img(
+    img: np.ndarray,
+    scale: int = 4,
+    crop=True,
+    cellpose_model='cyto2',
+    circle_center=(512, 512),
+    circle_radius=100,
+    diameter=15,
+):
     model = _new_cellpose_model(cellpose_model)
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
-    if crop:
-        img = mask_outside_circle(img, circle_center=circle_center, circle_radius=circle_radius)
-    seg_imgs = rescale(img, 1 / scale, anti_aliasing=True)
-    seg_imgs = (seg_imgs - seg_imgs.min()) / (seg_imgs.max() - seg_imgs.min())
+    seg_imgs = _normalize_for_cellpose(
+        img,
+        circle_center=circle_center if crop else None,
+        circle_radius=circle_radius if crop else None,
+    )
+    seg_imgs = rescale(seg_imgs, 1 / scale, anti_aliasing=True)
+    scaled_diameter = None if diameter is None else diameter / scale
     
     masks = eval_cellpose_model(
         model,
         seg_imgs,
         batch_size=1024,
         channels=channels,
-        diameter=50/scale,
+        diameter=scaled_diameter,
         flow_threshold=0.6,
         cellprob_threshold=-2,
         normalize=False,
@@ -189,8 +230,8 @@ def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float
     channels = [[0, 0]]
 
     # seg_imgs = img[::scale, ::scale]
-    seg_imgs = rescale(img, 1/scale, anti_aliasing=True)
-    seg_imgs = (seg_imgs - seg_imgs.min())/(seg_imgs.max() - seg_imgs.min())
+    seg_imgs = _normalize_for_cellpose(img)
+    seg_imgs = rescale(seg_imgs, 1/scale, anti_aliasing=True)
 
     masks = eval_cellpose_model(
         model,

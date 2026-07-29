@@ -71,6 +71,8 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
     )
     engine._mmc = MagicMock()
     engine._mmc.getCurrentConfig.return_value = "BF"
+    engine._mmc.getExposure.return_value = 10.0
+    engine._mmc.getAutoShutter.return_value = True
     engine.try_get_ZPosition = MagicMock(return_value=10)
     engine.try_get_XYPosition = MagicMock(return_value=(1000, 2000))
     stage_settling = MagicMock()
@@ -123,6 +125,11 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
     assert engine._mmc.setAutoShutter.call_args_list == [
         call(False),
         call(True),
+    ]
+    assert engine.try_setExp.call_args_list == [
+        call(0.1),
+        call(0.1),
+        call(10.0),
     ]
 
 
