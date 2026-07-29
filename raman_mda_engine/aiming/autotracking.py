@@ -18,20 +18,12 @@ from scipy import ndimage as ndi
 from scipy.ndimage import center_of_mass
 import multiprocessing as mp
 
+from ._cellpose import eval_cellpose_model, new_cellpose_model
+
 
 def _new_cellpose_model(model="cyto2"):
-    """Create Cellpose without making it a package import-time dependency."""
-    try:
-        from cellpose.models import Cellpose
-    except (ImportError, OSError) as exc:
-        raise RuntimeError(
-            "Cellpose/PyTorch could not be loaded. Install the "
-            "'raman-mda-engine[tracking]' extra in a binary-consistent "
-            "environment. On Windows, do not mix Conda MKL/OpenMP runtimes "
-            "with a pip PyTorch wheel."
-        ) from exc
-
-    return Cellpose(model_type=model, gpu=False)
+    """Backward-compatible alias for the lazy Cellpose loader."""
+    return new_cellpose_model(model)
 
 
 def run_tracking(labels, radius, tracking_config='particle_config.json'):
@@ -153,7 +145,8 @@ def segment_single_img(img: np.ndarray, scale: int = 4, crop=True, cellpose_mode
     seg_imgs = rescale(img, 1 / scale, anti_aliasing=True)
     seg_imgs = (seg_imgs - seg_imgs.min()) / (seg_imgs.max() - seg_imgs.min())
     
-    masks, flow, styles = model.cp.eval(
+    masks = eval_cellpose_model(
+        model,
         seg_imgs,
         batch_size=1024,
         channels=channels,
@@ -199,7 +192,8 @@ def find_com(img: np.ndarray, pt_xy: np.ndarray, scale: int=4, dist_thres: float
     seg_imgs = rescale(img, 1/scale, anti_aliasing=True)
     seg_imgs = (seg_imgs - seg_imgs.min())/(seg_imgs.max() - seg_imgs.min())
 
-    masks, flow, styles = model.cp.eval(
+    masks = eval_cellpose_model(
+        model,
         seg_imgs,
         batch_size=1024,
         channels=channels,
