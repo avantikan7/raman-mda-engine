@@ -26,6 +26,9 @@ class EventPayload(NamedTuple):
     image: np.ndarray
 class fakeAcquirer:
     """For development."""
+
+    daq = None
+
     def collect_spectra_relative(self, points, exposure=20):
         points = np.asarray(points)
         if points.min() < 0 or points.max() > 1:
@@ -41,6 +44,23 @@ class fakeAcquirer:
         assert points.shape[1] == 2
         arr = np.random.randn(points.shape[0], 1340) * exposure
         return np.cumsum(arr, axis=1)
+
+    def collect_spectra_pts(self, points, exposure=20):
+        return self.collect_spectra_volts(points, exposure)
+
+    def collect_spectra_pts_batch(self, points, exposure=20):
+        spectra = self.collect_spectra_volts(points, exposure)
+        return spectra.mean(axis=0, keepdims=True)
+
+
+def _source_has_role(source, role: str) -> bool:
+    """Use explicit source roles while retaining legacy name-based behavior."""
+    source_role = getattr(source, "role", None)
+    if source_role is not None:
+        return source_role == role
+    return role in source.name.lower()
+
+
 class RamanEngine(MDAEngine):
     _FILTER_DEVICE = "DigitalIO"
     _FILTER_MASK = 1 << 1  # Dev1/port0/line1
@@ -321,20 +341,31 @@ class RamanEngine(MDAEngine):
         points = []
         which = []
         for source in self.aiming_sources:
+            if not _source_has_role(source, "cell"):
+                continue
             new_points = source.get_mda_points(event)
-            if 'cell' in source.name.lower():
-                if self._batch and self._segment_and_track:
-                    xy = (np.array(new_points)*[self._image_x, self._image_y])/self._scale
-                    mask = self._last_segments[p]
-                    cell_id = mask[*np.mean(xy, axis=0).astype(int)]
-                    m = mask == cell_id
-                    in_mask = m[xy[:, 0].astype(int), xy[:, 1].astype(int)] != 0
-                    new_points = new_points[in_mask]
-                    # new_points = shrink_mask(shrink_mask(shrink_mask(shrink_mask(shrink_mask(new_points)))))
-                    new_points = shrink_mask(new_points)
-                    ###########################
-                points.append(new_points) # must be inside the loop
-                which.extend([source.name] * len(new_points))
+            if len(new_points) == 0:
+                continue
+            if self._batch and self._segment_and_track:
+                xy = (np.array(new_points)*[self._image_x, self._image_y])/self._scale
+                mask = self._last_segments[p]
+                cell_id = mask[*np.mean(xy, axis=0).astype(int)]
+                m = mask == cell_id
+                in_mask = m[xy[:, 0].astype(int), xy[:, 1].astype(int)] != 0
+                new_points = new_points[in_mask]
+                if len(new_points) == 0:
+                    continue
+                # new_points = shrink_mask(shrink_mask(shrink_mask(shrink_mask(shrink_mask(new_points)))))
+                new_points = shrink_mask(new_points)
+                ###########################
+            points.append(new_points) # must be inside the loop
+            which.extend([source.name] * len(new_points))
+        if not points:
+            logger.warning(
+                "Skipping Raman event with no selected cell points: {}",
+                event.index,
+            )
+            return
         points = np.vstack(points)
         # print(f"Before RM channel took {time.perf_counter() - st} s")
         # st = time.perf_counter()
@@ -342,10 +373,28 @@ class RamanEngine(MDAEngine):
         #     points, self._default_rm_exp
         # )
         # self._mmc.setConfig(event.channel.group, "RM")
-        self.try_set_config(self._channel_group_for_event(event), "RM")
+        self.try_set_config(
+            self._channel_group_for_event(event),
+            getattr(self, "_rm_channel", "RM"),
+        )
         # print(f"Setting RM channel took {time.perf_counter() - st} s")
         # st = time.perf_counter()
-        volts = self._transformer.BF_to_volts((points*[self._image_x, self._image_y])[:, :]/[self._image_y, self._image_x], max_volts = self._max_volt)
+        bf_points = (
+            (points * [self._image_x, self._image_y])[:, :]
+            / [self._image_y, self._image_x]
+        )
+        if self._transformer is None:
+            if not isinstance(self._spectra_collector, fakeAcquirer):
+                raise RuntimeError(
+                    "A coordinate transformer is required for Raman acquisition"
+                )
+            # Development mode uses an identity BF-to-Raman mapping.
+            volts = 2 * self._max_volt * bf_points - self._max_volt
+        else:
+            volts = self._transformer.BF_to_volts(
+                bf_points,
+                max_volts=self._max_volt,
+            )
         if pre_acq:
             _ = self._spectra_collector.collect_spectra_pts(np.tile(volts[0], (2, 1)), 100)
         if not self._batch:
@@ -459,12 +508,20 @@ class RamanEngine(MDAEngine):
         points = []
         which = []
         for source in self.aiming_sources:
-            # if ("autofocus" in source.name.lower()) and (self._autofocus_object in ['glass', 'quartz']):
-            if "autofocus" in source.name.lower():
+            if not _source_has_role(source, "cell"):
                 continue
-            new_points = source.get_mda_points(event, transform=False) * [self._image_x, self._image_y]
+            try:
+                new_points = source.get_mda_points(event, transform=False)
+            except TypeError:
+                new_points = source.get_mda_points(event)
+            new_points = new_points * [self._image_x, self._image_y]
+            if len(new_points) == 0:
+                continue
             points.append(new_points)
             which.extend([source.name] * len(new_points))
+        if not points:
+            print("[WARNING] no cell points available for aiming update")
+            return
         points = np.vstack(points)
         which = np.asarray(which)
         P = event.index.get("p", -1)
@@ -494,6 +551,19 @@ class RamanEngine(MDAEngine):
             self.raman_events.aimUpdated.emit(event, img, self._last_segments[P], points, points)
             return
         prev = self._last_segments[P]
+        target_mask = self._last_segments[P - 1] if can_reuse else new_mask
+        if not np.any(prev) or not np.any(target_mask):
+            # With no segmented objects there is nothing to match. Keep each
+            # layer's existing coordinates instead of failing the acquisition.
+            self._last_segments[P] = target_mask
+            self.raman_events.aimUpdated.emit(
+                event,
+                img,
+                target_mask,
+                points,
+                points,
+            )
+            return
         if can_reuse:
             labels = np.vstack([prev[None, :], self._last_segments[P-1][None, :]])
             tracked, new_pts = track_one_T(
@@ -519,15 +589,13 @@ class RamanEngine(MDAEngine):
             self._last_segments[P] = new_mask
         self.raman_events.aimUpdated.emit(event, img, self._last_segments[P], new_pts, points)
         for source in self.aiming_sources:
-            # if ("autofocus" in source.name.lower()) and (self._autofocus_object in ['glass', 'quartz']):
-            if "autofocus" in source.name.lower():
+            if not _source_has_role(source, "cell"):
                 continue
             source_points = new_pts[which == source.name]
             if hasattr(source, "set_mda_points"):
                 source.set_mda_points(pos, source_points)
-            else:
+            elif hasattr(source, "_points"):
                 update_pos_points(pos, source_points, source._points)
-            return
     def reload(self, N=100):
         n = 0.1  # starting sleep time
         for attempt in range(N):
@@ -1078,16 +1146,28 @@ class RamanEngine(MDAEngine):
                 # ---- Step 1: autofocus ----
                 if self._autofocus and do_refocus and pos in self._autofocus_p:
                     points = None
+                    autofocus_source_found = False
                     for source in self.aiming_sources:
-                        if 'autofocus' in source.name.lower():
+                        if _source_has_role(source, "autofocus"):
+                            autofocus_source_found = True
                             points = source.get_mda_points(event, transform=False)
-                    pt = np.array(points[0])
-                    print('-----------Autofocusing-----------')
-                    _, self._bestZ, _ = self.autofocus_w_raman(
-                        self._last_best_z[pos], pt, t, pos
-                    )
-                    print(f'autofocus z = {self._bestZ}')
-                    self._last_best_z[pos] = self._bestZ
+                    if not autofocus_source_found:
+                        logger.warning(
+                            "Autofocus is enabled but no autofocus source is "
+                            "configured; continuing without autofocus"
+                        )
+                    elif points is None or len(points) == 0:
+                        raise ValueError(
+                            f"No autofocus point is available at position {pos}"
+                        )
+                    else:
+                        pt = np.array(points[0])
+                        print('-----------Autofocusing-----------')
+                        _, self._bestZ, _ = self.autofocus_w_raman(
+                            self._last_best_z[pos], pt, t, pos
+                        )
+                        print(f'autofocus z = {self._bestZ}')
+                        self._last_best_z[pos] = self._bestZ
                 # ---- Step 2: aiming update ----
                 if self._segment_and_track and do_refocus:
                     self.try_set_ZPosition(self._last_best_z[pos])

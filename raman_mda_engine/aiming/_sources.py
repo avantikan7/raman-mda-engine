@@ -62,11 +62,34 @@ class SnappableRamanAimingSource(RamanAimingSource, Protocol):
 
 
 class BaseSource:
-    def __init__(self, name: str = None, transformer: Transformer = None) -> None:
+    def __init__(
+        self,
+        name: str = None,
+        transformer: Transformer = None,
+        *,
+        role: str = None,
+        display_name: str = None,
+        source_id: str = None,
+        color: str = None,
+    ) -> None:
         if name is None:
             self._name = str(uuid.uuid1())
         else:
             self._name = name
+        inferred_role = None
+        lower_name = self._name.lower()
+        if "autofocus" in lower_name:
+            inferred_role = "autofocus"
+        elif "cell" in lower_name:
+            inferred_role = "cell"
+        self._role = role or inferred_role
+        self._display_name = display_name or (
+            self._name.split(":", 1)[1]
+            if self._name.lower().startswith("cell:") and ":" in self._name
+            else self._name
+        )
+        self._source_id = source_id or str(uuid.uuid4())
+        self._color = color
         if transformer is None:
             self.transformer = Identity()
         else:
@@ -75,6 +98,36 @@ class BaseSource:
     @property
     def name(self) -> str:
         return self._name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        value = str(value).strip()
+        if not value:
+            raise ValueError("Aiming source name cannot be empty")
+        self._name = value
+
+    @property
+    def role(self) -> str | None:
+        return self._role
+
+    @property
+    def display_name(self) -> str:
+        return self._display_name
+
+    @display_name.setter
+    def display_name(self, value: str) -> None:
+        value = str(value).strip()
+        if not value:
+            raise ValueError("Aiming source display name cannot be empty")
+        self._display_name = value
+
+    @property
+    def source_id(self) -> str:
+        return self._source_id
+
+    @property
+    def color(self) -> str | None:
+        return self._color
 
     @property
     def transformer(self) -> Transformer:
@@ -99,7 +152,7 @@ class SimpleGridSource(BaseSource):
         self._grid = np.hstack([x[:, None], y[:, None]])
         if name is None:
             name = f"grid-{N_x}_{N_y}-{uuid.uuid1()}"
-        super().__init__(name)
+        super().__init__(name, role="cell")
 
     def get_current_points(self):
         """
@@ -174,6 +227,11 @@ class PointsLayerSource(BaseSource):
         position_idx: int = 1,
         img_shape: tuple[int, int] = None,
         transformer: Transformer = None,
+        *,
+        role: str = None,
+        display_name: str = None,
+        source_id: str = None,
+        color: str = None,
     ) -> None:
         """
         A Source based on napari points layer.
@@ -201,7 +259,18 @@ class PointsLayerSource(BaseSource):
             self._img_shape = img_shape
         if name is None:
             name = f"points-{uuid.uuid1()}"
-        super().__init__(name, transformer=transformer)
+        super().__init__(
+            name,
+            transformer=transformer,
+            role=role,
+            display_name=display_name,
+            source_id=source_id,
+            color=color,
+        )
+
+    @property
+    def points_layer(self) -> BroadcastablePoints:
+        return self._points
 
     def _get_pos_points(self, points: np.ndarray, pos: int):
         return points[points[:, self._pos_idx] == pos][:, -2:]
