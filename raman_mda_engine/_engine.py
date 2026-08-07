@@ -64,6 +64,7 @@ def _source_has_role(source, role: str) -> bool:
 class RamanEngine(MDAEngine):
     _FILTER_DEVICE = "DigitalIO"
     _FILTER_MASK = 1 << 1  # Dev1/port0/line1
+    _RELOAD_INITIAL_DELAY_S = 5.0
     def __init__(
         self,
         mmc: CMMCorePlus = None,
@@ -98,6 +99,7 @@ class RamanEngine(MDAEngine):
         circle_radius=100,
         stage_centering_model=None,
         cell_diameter=15,
+        point_repeats=1,
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -143,6 +145,9 @@ class RamanEngine(MDAEngine):
         cell_diameter : float or None
             Expected cell diameter in pixels in the original segmentation
             image. ``None`` uses the diameter stored with the Cellpose model.
+        point_repeats : int, default 1
+            Number of consecutive frames to acquire at each selected Raman
+            aiming point.
         """
         # MDAEngine uses the core immediately during its initialization (for
         # example, to read the auto-shutter state), so it must never receive
@@ -170,6 +175,7 @@ class RamanEngine(MDAEngine):
         self._segment_crop = segment_crop
         self._cellpose_model = cellpose_model
         self._cell_diameter = cell_diameter
+        self._point_repeats = max(1, int(point_repeats))
         self._tracking_config = tracking_config
         self._scale = scale
         self._skip_imaging_for_same_pos = skip_imaging_for_same_pos
@@ -367,6 +373,10 @@ class RamanEngine(MDAEngine):
             )
             return
         points = np.vstack(points)
+        point_repeats = getattr(self, "_point_repeats", 1)
+        if point_repeats > 1:
+            points = np.repeat(points, point_repeats, axis=0)
+            which = [name for name in which for _ in range(point_repeats)]
         # print(f"Before RM channel took {time.perf_counter() - st} s")
         # st = time.perf_counter()
         # spec = self._spectra_collector.collect_spectra_relative(
@@ -597,7 +607,9 @@ class RamanEngine(MDAEngine):
             elif hasattr(source, "_points"):
                 update_pos_points(pos, source_points, source._points)
     def reload(self, N=100):
-        n = 0.1  # starting sleep time
+        # Give transient camera/device errors time to clear before tearing down
+        # and rebuilding the entire Micro-Manager hardware configuration.
+        n = self._RELOAD_INITIAL_DELAY_S
         for attempt in range(N):
             if attempt == N-1:
                 print('reach reloading maxiter')

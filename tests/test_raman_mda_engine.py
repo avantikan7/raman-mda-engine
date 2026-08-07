@@ -24,6 +24,19 @@ def test_engine_stores_segmentation_circle_radius(core: CMMCorePlus):
     assert engine._circle_radius == 123
 
 
+def test_reload_waits_before_unloading_devices():
+    engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
+    engine._config_file = "hardware.cfg"
+    engine.try_set_config = MagicMock()
+
+    with patch("raman_mda_engine._engine.time.sleep") as sleep:
+        engine.reload(N=1)
+
+    sleep.assert_called_once_with(5.0)
+    engine._mmc.unloadAllDevices.assert_called_once_with()
+
+
 def test_record_raman_combines_named_cell_layers_and_skips_empty_layers():
     class _Source:
         def __init__(self, name, points):
@@ -52,8 +65,9 @@ def test_record_raman_combines_named_cell_layers_and_skips_empty_layers():
     engine._transformer.BF_to_volts.side_effect = lambda points, **_kwargs: points
     engine._spectra_collector = MagicMock()
     engine._spectra_collector.collect_spectra_pts.return_value = np.ones(
-        (3, 4)
+        (6, 4)
     )
+    engine._point_repeats = 2
     engine.raman_events = MagicMock()
 
     event = MDAEvent(
@@ -65,13 +79,27 @@ def test_record_raman_combines_named_cell_layers_and_skips_empty_layers():
     emitted = engine.raman_events.ramanSpectraReady.emit.call_args.args
     np.testing.assert_allclose(
         emitted[2],
-        [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+        [
+            [0.1, 0.2],
+            [0.1, 0.2],
+            [0.3, 0.4],
+            [0.3, 0.4],
+            [0.5, 0.6],
+            [0.5, 0.6],
+        ],
     )
     assert emitted[3] == [
         "cell:Type A",
         "cell:Type A",
+        "cell:Type A",
+        "cell:Type A",
+        "cell:Type B",
         "cell:Type B",
     ]
+    collected_points = (
+        engine._spectra_collector.collect_spectra_pts.call_args.args[0]
+    )
+    assert collected_points.shape == (6, 2)
 
 
 def test_laser_autofocus_stage_positions_use_pixel_to_stage_model():
