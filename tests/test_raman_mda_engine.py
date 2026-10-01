@@ -257,10 +257,53 @@ def test_teardown_sequence_closes_shutter_and_restores_autoshutter():
     engine._mmc = MagicMock()
     engine._autoshutter_was_set = True
 
-    engine.teardown_sequence(MDASequence())
+    with patch("pymmcore_plus.mda.MDAEngine.teardown_sequence") as teardown:
+        engine.teardown_sequence(MDASequence())
 
+    teardown.assert_called_once()
     engine._mmc.setShutterOpen.assert_called_once_with(False)
     engine._mmc.setAutoShutter.assert_called_once_with(True)
+    engine._mmc.setConfig.assert_called_once_with("Channel", "BF")
+    assert engine._mmc.waitForSystem.call_count == 2
+
+
+@pytest.mark.parametrize("axis_order", ["tpcz", "cpzt"])
+def test_brightfield_restored_only_after_every_mda_event(axis_order):
+    from pymmcore_plus.mda import MDARunner
+
+    sequence = MDASequence(
+        axis_order=axis_order,
+        channels=("GFP", "RM"),
+        stage_positions=((0, 0), (1, 1)),
+        z_plan={"relative": (0, 1)},
+        time_plan={"interval": 0, "loops": 2},
+    )
+    engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
+    engine._autoshutter_was_set = False
+    engine.setup_sequence = MagicMock(return_value={})
+    engine.event_iterator = lambda events: iter(events)
+    engine.setup_event = MagicMock()
+    engine.teardown_event = MagicMock()
+    acquired = []
+
+    def acquire(event):
+        engine._mmc.setConfig.assert_not_called()
+        acquired.append(dict(event.index))
+        return ()
+
+    engine.exec_event = acquire
+    with patch("pymmcore_plus.mda.MDAEngine.teardown_sequence") as teardown:
+        # Base cleanup may restore the original channel; BF must be set later.
+        teardown.side_effect = lambda _seq: engine._mmc.setConfig.assert_not_called()
+        runner = MDARunner()
+        runner.set_engine(engine)
+        runner.run(sequence)
+
+    assert acquired == [dict(event.index) for event in sequence.iter_events()]
+    assert len(acquired) == 16
+    teardown.assert_called_once_with(sequence)
+    engine._mmc.setConfig.assert_called_once_with("Channel", "BF")
     engine._mmc.waitForSystem.assert_called_once_with()
 
 

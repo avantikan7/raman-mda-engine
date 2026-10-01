@@ -1256,7 +1256,7 @@ class RamanEngine(MDAEngine):
             yield ImagePayload(image=image, event=event, metadata=meta)
 
     def teardown_sequence(self, sequence: MDASequence) -> None:
-        """Restore automatic shutter mode after completion or cancellation."""
+        """Return to BF once the entire MDA has ended (including cancellation)."""
         try:
             if self._autoshutter_was_set:
                 self._mmc.setShutterOpen(False)
@@ -1264,3 +1264,8 @@ class RamanEngine(MDAEngine):
                 self._mmc.waitForSystem()
         finally:
             super().teardown_sequence(sequence)
+            # This is sequence cleanup, never per-event cleanup: all timepoints,
+            # positions, channels, Z slices, and Raman points must finish first.
+            # Apply BF after the base engine restores any initial hardware state.
+            self._mmc.setConfig("Channel", "BF")
+            self._mmc.waitForSystem()
