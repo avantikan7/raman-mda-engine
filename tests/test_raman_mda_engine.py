@@ -236,6 +236,35 @@ def test_setup_event_adds_offset_for_each_explicit_channel():
         assert engine.try_set_ZPosition.call_args == call(expected_z)
 
 
+@pytest.mark.parametrize("cadence, expected_times", [(0, [0]), (1, [0, 1, 2, 3]), (2, [0, 2])])
+def test_refocus_cadence_preserves_initial_focus_and_segmentation(cadence, expected_times):
+    engine = MagicMock(spec=RamanEngine)
+    engine._autofocus = True
+    engine._segment_and_track = True
+    engine._refocus_every = cadence
+    engine._last_pos = None
+    engine._last_best_z = {}
+    engine._last_images = {}
+    engine._autofocus_p = [0]
+    engine._segment_channel = "BF"
+    engine._last_operation_reloaded = False
+    engine._channel_offset_for_event.return_value = 0
+    source = MagicMock()
+    source.role = "autofocus"
+    source.get_mda_points.return_value = [[512, 512]]
+    engine.aiming_sources = [source]
+    engine.autofocus_w_raman.return_value = (None, 100, None)
+
+    with patch("raman_mda_engine._engine.time.sleep"):
+        for t in range(4):
+            event = MDAEvent(index={"p": 0, "t": t}, z_pos=100)
+            RamanEngine.setup_event(engine, event)
+            RamanEngine.setup_event(engine, event)
+
+    assert [c.args[2] for c in engine.autofocus_w_raman.call_args_list] == expected_times
+    assert [c.args[1].index["t"] for c in engine.update_aim.call_args_list] == expected_times
+
+
 def test_setup_event_holds_shutter_open_when_requested():
     engine = object.__new__(RamanEngine)
     engine._mmc = MagicMock()

@@ -91,7 +91,7 @@ class RamanEngine(MDAEngine):
         search_pts=20,
         fine_search_range=1.5,
         fine_search_pts=15,
-        refocus_every=1,
+        refocus_every=0,
         image_x=1344,
         image_y=1024,
         config_file = None,
@@ -185,7 +185,7 @@ class RamanEngine(MDAEngine):
         self._search_pts = search_pts
         self._fine_search_range = fine_search_range
         self._fine_search_pts = fine_search_pts
-        self._refocus_every = max(1, int(refocus_every))
+        self._refocus_every = max(0, int(refocus_every))
         self._config_file = config_file
         # image dimensions in pixels (X = 1344, Y = 1024 by default)
         self._image_x = image_x
@@ -1134,8 +1134,10 @@ class RamanEngine(MDAEngine):
                 self._last_pos = (t, pos)
                 # Do we refresh focus / aiming on THIS timepoint?
                 # t == 0 always runs (need a baseline mask + z per position);
-                # after that, only every _refocus_every timepoints.
-                do_refocus = (t == 0) or (t % self._refocus_every == 0)
+                # after that, 0 disables updates; positive values set the cadence.
+                do_refocus = (t == 0) or (
+                    self._refocus_every > 0 and t % self._refocus_every == 0
+                )
                 # ---- Baseline best-z for this position ----
                 if self._last_best_z.get(pos) is None:
                     if pos in self._autofocus_p or not self._last_best_z:
