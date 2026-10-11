@@ -255,8 +255,48 @@ class RamanEngine(MDAEngine):
             return next((c.z_offset for c in event.sequence.channels if c.config == channel), 0.0)
         return 0.0
 
+    def _is_raman_event(self, event: MDAEvent) -> bool:
+        return bool(
+            getattr(self, "_rm_meta", None)
+            and isinstance(event.action, (AcquireImage, type(None)))
+            and (event.channel is None or event.channel.config == self._rm_channel)
+        )
+
+    def _raman_shutters(self, event: MDAEvent):
+        """Resolve camera and laser shutters without assuming they share Core.Shutter.
+
+        Some rigs switch Core.Shutter to the laser in RM; others leave it on
+        the BF camera and drive the laser through the RM preset's DigitalIO.
+        """
+        group = self._channel_group_for_event(event)
+
+        def preset_shutter(config):
+            for device, prop, value in self._mmc.getConfigData(group, config):
+                if device == "Core" and prop == "Shutter":
+                    return value
+            return None
+
+        camera = preset_shutter("BF")
+        laser = getattr(self, "_shutter_device", None) or preset_shutter(self._rm_channel)
+        if not camera:
+            current = self._mmc.getShutterDevice()
+            camera = current if isinstance(current, str) and current != laser else None
+        if laser == camera:
+            laser = None
+        return camera, laser
+
     def _prepare_shutter_for_event(self, event: MDAEvent) -> None:
         """Hold the configured shutter open when the next event permits it."""
+        if self._is_raman_event(event):
+            camera, laser = self._raman_shutters(event)
+            self._active_raman_shutters = (camera, laser)
+            if camera:
+                self._mmc.setShutterOpen(camera, False)
+            if laser:
+                self._mmc.setShutterOpen(laser, True)
+            # With a config-driven laser the RM preset already opens it.
+            self._mmc.waitForSystem()
+            return
         if (
             self._autoshutter_was_set
             and event.keep_shutter_open
@@ -268,6 +308,17 @@ class RamanEngine(MDAEngine):
 
     def _finish_shutter_for_event(self, event: MDAEvent) -> None:
         """Close a shutter previously managed through automatic shutter mode."""
+        if self._is_raman_event(event):
+            camera, laser = self._raman_shutters(event)
+            if not event.keep_shutter_open:
+                if laser:
+                    self._mmc.setShutterOpen(laser, False)
+                elif camera:
+                    self.try_set_config(self._channel_group_for_event(event), "BF")
+            if camera:
+                self._mmc.setShutterOpen(camera, False)
+            self._mmc.waitForSystem()
+            return
         if self._autoshutter_was_set and not event.keep_shutter_open:
             self._mmc.setShutterOpen(False)
             self._mmc.waitForSystem()
@@ -384,6 +435,8 @@ class RamanEngine(MDAEngine):
             self._channel_group_for_event(event),
             getattr(self, "_rm_channel", "RM"),
         )
+        if self._is_raman_event(event):
+            self._prepare_shutter_for_event(event)
         # print(f"Setting RM channel took {time.perf_counter() - st} s")
         # st = time.perf_counter()
         bf_points = (
@@ -462,6 +515,7 @@ class RamanEngine(MDAEngine):
     @slack_notify
     def setup_sequence(self, sequence: MDASequence) -> None:
         super().setup_sequence(sequence)
+        self._active_raman_shutters = (None, None)
         raw_offsets = sequence.metadata.get("channel_z_offsets_um", {})
         if not isinstance(raw_offsets, dict):
             raise ValueError("channel_z_offsets_um metadata must be a mapping")
@@ -1126,7 +1180,12 @@ class RamanEngine(MDAEngine):
             super().setup_event(event)
             return
         if not (self._autofocus or self._segment_and_track) and not getattr(self, "_channel_z_offsets", {}):
-            super().setup_event(event)
+            # Base setup interprets keep-open as opening Core.Shutter, which
+            # may still be the BF camera shutter on a config-driven laser rig.
+            super().setup_event(event.model_copy(update={"keep_shutter_open": False})
+                                if self._is_raman_event(event) else event)
+            if self._is_raman_event(event):
+                self._prepare_shutter_for_event(event)
             return
         # st = time.perf_counter()
         if event.x_pos is not None or event.y_pos is not None or event.z_pos is not None:
@@ -1250,10 +1309,14 @@ class RamanEngine(MDAEngine):
         # print(f"setting the z pos took {time.perf_counter() - st} s")
         # st = time.perf_counter()
     def exec_event(self, event: MDAEvent) -> Any:
+        completed = False
         try:
             yield from self._exec_event(event)
+            completed = True
         finally:
-            self._finish_shutter_for_event(event)
+            self._finish_shutter_for_event(
+                event if completed else event.model_copy(update={"keep_shutter_open": False})
+            )
 
     def _exec_event(self, event: MDAEvent) -> Any:
         if isinstance(event.action, HardwareAutofocus):
@@ -1261,13 +1324,7 @@ class RamanEngine(MDAEngine):
             return
         if not isinstance(event.action, (AcquireImage, type(None))):
             return
-        is_raman_event = bool(
-            self._rm_meta
-            and (
-                event.channel is None
-                or event.channel.config == self._rm_channel
-            )
-        )
+        is_raman_event = self._is_raman_event(event)
         if is_raman_event:
             if event.index.get("z", 0) in self._rm_z:
                 # st = time.perf_counter()
@@ -1298,15 +1355,23 @@ class RamanEngine(MDAEngine):
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Return to BF once the entire MDA has ended (including cancellation)."""
         try:
+            camera, laser = getattr(self, "_active_raman_shutters", (None, None))
+            if laser:
+                self._mmc.setShutterOpen(laser, False)
+            if camera:
+                self._mmc.setShutterOpen(camera, False)
             if self._autoshutter_was_set:
                 self._mmc.setShutterOpen(False)
                 self._mmc.setAutoShutter(True)
                 self._mmc.waitForSystem()
         finally:
             super().teardown_sequence(sequence)
-            # This is sequence cleanup, never per-event cleanup: all timepoints,
-            # positions, channels, Z slices, and Raman points must finish first.
-            # Apply BF after the base engine restores any initial hardware state.
+            # Apply BF after the base engine restores any initial hardware state,
+            # including cancellation while the laser was being held open.
             if getattr(self, "_rm_meta", True) or "BF" in self._mmc.getAvailableConfigs(self._mmc.getChannelGroup() or "Channel"):
                 self._mmc.setConfig("Channel", "BF")
+                self._mmc.waitForSystem()
+            camera, _ = getattr(self, "_active_raman_shutters", (None, None))
+            if camera:
+                self._mmc.setShutterOpen(camera, False)
                 self._mmc.waitForSystem()

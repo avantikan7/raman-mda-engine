@@ -276,6 +276,7 @@ def test_refocus_cadence_preserves_initial_focus_and_segmentation(cadence, segme
 def test_setup_event_holds_shutter_open_when_requested():
     engine = object.__new__(RamanEngine)
     engine._mmc = MagicMock()
+    engine._mmcore_ref = lambda: engine._mmc
     engine._mmc.getAutoShutter.return_value = True
     engine._autoshutter_was_set = True
     engine._autofocus = False
@@ -287,6 +288,57 @@ def test_setup_event_holds_shutter_open_when_requested():
     engine._mmc.setAutoShutter.assert_called_once_with(False)
     engine._mmc.setShutterOpen.assert_called_once_with(True)
     engine._mmc.waitForSystem.assert_called_once_with()
+
+
+@pytest.mark.parametrize("config_driven", [False, True])
+@pytest.mark.parametrize("keep_open", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_raman_keep_open_controls_laser_and_never_opens_camera(config_driven, keep_open, fails):
+    engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
+    engine._autofocus = engine._segment_and_track = False
+    engine._channel_z_offsets = {}
+    engine._rm_meta = {"channel": "RM"}
+    engine._rm_channel = "RM"
+    engine._rm_z = [0]
+    engine._pre_acq = False
+    states = {"camera": True, "laser": False}
+    engine._mmc.getConfigData.side_effect = lambda group, config: (
+        [("Core", "Shutter", "camera")] if config == "BF" else
+        ([] if config_driven else [("Core", "Shutter", "laser")])
+    )
+    engine._mmc.getShutterDevice.return_value = "camera"
+    engine._mmc.setShutterOpen.side_effect = lambda device, opened: states.update({device: opened})
+    engine._mmc.setConfig.side_effect = lambda group, config: states.update(laser=config == "RM")
+    engine.try_set_config = engine._mmc.setConfig
+    event = MDAEvent(channel={"group": "Channel", "config": "RM"}, keep_shutter_open=keep_open)
+
+    def base_setup(prepared):
+        assert not prepared.keep_shutter_open
+        engine._mmc.setConfig("Channel", "RM")
+
+    with patch("pymmcore_plus.mda.MDAEngine.setup_event", side_effect=base_setup):
+        engine.setup_event(event)
+    assert states == {"camera": False, "laser": True}
+
+    def collect(*args, **kwargs):
+        assert states == {"camera": False, "laser": True}
+        if fails:
+            raise RuntimeError("detector failed")
+
+    engine.record_raman = MagicMock(side_effect=collect)
+    if fails:
+        with pytest.raises(RuntimeError, match="detector failed"):
+            list(engine.exec_event(event))
+    else:
+        assert list(engine.exec_event(event)) == []
+    assert states == {"camera": False, "laser": keep_open and not fails}
+    assert call("camera", True) not in engine._mmc.setShutterOpen.call_args_list
+
+    engine._autoshutter_was_set = False
+    with patch("pymmcore_plus.mda.MDAEngine.teardown_sequence"):
+        engine.teardown_sequence(MDASequence())
+    assert states == {"camera": False, "laser": False}
 
 
 def test_teardown_sequence_closes_shutter_and_restores_autoshutter():
@@ -407,6 +459,7 @@ def test_channel_less_raman_event_has_no_camera_payload():
 
 def test_explicit_raman_channel_has_no_camera_payload():
     engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
     engine._rm_meta = {"channel": "RM", "z": [0]}
     engine._rm_channel = "RM"
     engine._rm_z = np.array([0])
