@@ -236,12 +236,18 @@ def test_setup_event_adds_offset_for_each_explicit_channel():
         assert engine.try_set_ZPosition.call_args == call(expected_z)
 
 
-@pytest.mark.parametrize("cadence, expected_times", [(0, [0]), (1, [0, 1, 2, 3]), (2, [0, 2])])
-def test_refocus_cadence_preserves_initial_focus_and_segmentation(cadence, expected_times):
+@pytest.mark.parametrize("cadence, segment_every, expected_times, expected_segments", [
+    (0, None, [0], [0]), (1, None, [0, 1, 2, 3], [0, 1, 2, 3]),
+    (2, None, [0, 2], [0, 2]), (2, 3, [0, 2], [0, 3]),
+])
+def test_refocus_cadence_preserves_initial_focus_and_segmentation(cadence, segment_every, expected_times, expected_segments):
     engine = MagicMock(spec=RamanEngine)
+    engine._mmc = MagicMock()
     engine._autofocus = True
     engine._segment_and_track = True
     engine._refocus_every = cadence
+    if segment_every is not None:
+        engine._segment_every = segment_every
     engine._last_pos = None
     engine._last_best_z = {}
     engine._last_images = {}
@@ -257,12 +263,14 @@ def test_refocus_cadence_preserves_initial_focus_and_segmentation(cadence, expec
 
     with patch("raman_mda_engine._engine.time.sleep"):
         for t in range(4):
-            event = MDAEvent(index={"p": 0, "t": t}, z_pos=100)
+            event = MDAEvent(index={"p": 0, "t": t}, z_pos=100,
+                             channel={"group": "Channel", "config": "GFP"})
             RamanEngine.setup_event(engine, event)
             RamanEngine.setup_event(engine, event)
 
     assert [c.args[2] for c in engine.autofocus_w_raman.call_args_list] == expected_times
-    assert [c.args[1].index["t"] for c in engine.update_aim.call_args_list] == expected_times
+    assert [c.args[1].index["t"] for c in engine.update_aim.call_args_list] == expected_segments
+    assert engine.try_set_config.call_args == call("Channel", "GFP")
 
 
 def test_setup_event_holds_shutter_open_when_requested():

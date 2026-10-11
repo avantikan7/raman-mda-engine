@@ -8,7 +8,7 @@ import numpy as np
 from loguru import logger
 from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.mda import MDAEngine
-from useq import MDAEvent
+from useq import MDAEvent, HardwareAutofocus, AcquireImage
 from scipy.ndimage import center_of_mass
 from qtpy.QtCore import QTimer
 from tqdm.auto import tqdm
@@ -100,6 +100,7 @@ class RamanEngine(MDAEngine):
         stage_centering_model=None,
         cell_diameter=15,
         point_repeats=1,
+        segment_every=None,
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -162,7 +163,7 @@ class RamanEngine(MDAEngine):
         self.raman_events = RamanSignaler()
         self._spectra_collector = spectra_collector
         self._transformer = transformer
-        self._daq = spectra_collector.daq
+        self._daq = getattr(spectra_collector, "daq", None)
         self._batch = batch
         self._pre_acq = bool(pre_acq)
         self._autofocus = autofocus
@@ -186,6 +187,7 @@ class RamanEngine(MDAEngine):
         self._fine_search_range = fine_search_range
         self._fine_search_pts = fine_search_pts
         self._refocus_every = max(0, int(refocus_every))
+        self._segment_every = self._refocus_every if segment_every is None else max(0, int(segment_every))
         self._config_file = config_file
         # image dimensions in pixels (X = 1344, Y = 1024 by default)
         self._image_x = image_x
@@ -194,15 +196,6 @@ class RamanEngine(MDAEngine):
         self._circle_center = circle_center
         self._circle_radius = circle_radius
         self._stage_centering_model = stage_centering_model
-        if self._spectra_collector is None:
-            try:
-                from raman_control import SpectraCollector
-                self._spectra_collector = SpectraCollector.instance()
-            except ImportError:
-                self._spectra_collector = None
-                logger.warning(
-                    "Could not import SpectraCollector - No raman collection"
-                )
         self._rm_meta = None
         self.aiming_sources = sources if sources is not None else []
         self._sources: list[RamanAimingSource]
@@ -256,7 +249,11 @@ class RamanEngine(MDAEngine):
             channel = self._rm_channel
         else:
             return 0.0
-        return self._channel_z_offsets.get(channel, 0.0)
+        if channel in self._channel_z_offsets:
+            return self._channel_z_offsets[channel]
+        if event.sequence is not None:
+            return next((c.z_offset for c in event.sequence.channels if c.config == channel), 0.0)
+        return 0.0
 
     def _prepare_shutter_for_event(self, event: MDAEvent) -> None:
         """Hold the configured shutter open when the next event permits it."""
@@ -483,24 +480,25 @@ class RamanEngine(MDAEngine):
                 raise RuntimeError("No aiming sources - cannot collect Raman.")
             self._rm_channel = raman_meta.get("channel", "RM")
             z = raman_meta.get("z", "all")
-            z_index = self._sequence_axis_order(sequence).index("z")
+            z_index = self._sequence_axis_order(sequence).index("z") if "z" in self._sequence_axis_order(sequence) else None
             if isinstance(z, str):
                 if z.lower() == "center":
-                    n_z = sequence.shape[z_index]
+                    n_z = sequence.shape[z_index] if z_index is not None else 1
                     if n_z % 2 == 0:
                         raise ValueError("for z=center n_z must be odd.")
                     z = np.array(n_z // 2)
                 elif z.lower() in ["all", "stack"]:
-                    z = np.arange(sequence.shape[z_index])
+                    z = np.arange(sequence.shape[z_index] if z_index is not None else 1)
             else:
                 z = np.asanyarray(z)
             self._rm_z = z
             self._rm_meta = raman_meta
-        self._z_rel = sequence.z_plan.positions()
+        self._z_rel = list(sequence.z_plan.positions()) if sequence.z_plan else [0.0]
         self._last_segments = {}
         # gate on (t, pos) so seg-and-track fires once per position PER timepoint,
         # even with a single position. (-1, -1) is a sentinel that never matches.
         self._last_pos = (-1, -1)
+        self._updated_positions = set()
         self._last_best_z = {}
         self._last_images = {}
         self._tracks = {}
@@ -1114,7 +1112,22 @@ class RamanEngine(MDAEngine):
         return focusZ, max_laser_offset+focusZ, coarse_raman
 
 
+    def event_iterator(self, events):
+        # Raman/target operations are per event and cannot use camera hardware batches.
+        from .grid_plan import iter_grid_events
+        from useq import MDASequence
+        if isinstance(events, MDASequence):
+            yield from iter_grid_events(events)
+        else:
+            yield from events
+
     def setup_event(self, event: MDAEvent) -> None:
+        if isinstance(event.action, HardwareAutofocus):
+            super().setup_event(event)
+            return
+        if not (self._autofocus or self._segment_and_track) and not getattr(self, "_channel_z_offsets", {}):
+            super().setup_event(event)
+            return
         # st = time.perf_counter()
         if event.x_pos is not None or event.y_pos is not None or event.z_pos is not None:
             x = event.x_pos if event.x_pos is not None else self._mmc.getXPosition()
@@ -1130,7 +1143,11 @@ class RamanEngine(MDAEngine):
             pos = event.index.get("p", 0)
             t = event.index.get("t", 0)
             # fire once per (timepoint, position) -- robust to single position
-            if (t, pos) != self._last_pos:
+            updated = getattr(self, "_updated_positions", None)
+            if updated is None:
+                updated = self._updated_positions = set()
+            if (t, pos) not in updated:
+                updated.add((t, pos))
                 self._last_pos = (t, pos)
                 # Do we refresh focus / aiming on THIS timepoint?
                 # t == 0 always runs (need a baseline mask + z per position);
@@ -1140,10 +1157,14 @@ class RamanEngine(MDAEngine):
                 )
                 # ---- Baseline best-z for this position ----
                 if self._last_best_z.get(pos) is None:
-                    if pos in self._autofocus_p or not self._last_best_z:
+                    if not self._autofocus or pos in self._autofocus_p or not self._last_best_z:
                         # autofocus position (or the very first position):
                         # trust the sequence z as the starting point
                         base = event.z_pos
+                        if base is not None and event.sequence is not None and (event.sequence.z_plan is None or event.sequence.z_plan.is_relative):
+                            relative = self._z_rel[event.index.get("z", 0)]
+                            base -= relative + self._channel_offset_for_event(event)
+                            base += getattr(self, "_z_correction", {}).get(pos, 0.0)
                         if base is None:
                             base = self.try_get_ZPosition()
                     else:
@@ -1183,7 +1204,9 @@ class RamanEngine(MDAEngine):
                         print(f'autofocus z = {self._bestZ}')
                         self._last_best_z[pos] = self._bestZ
                 # ---- Step 2: aiming update ----
-                if self._segment_and_track and do_refocus:
+                segment_every = getattr(self, "_segment_every", self._refocus_every)
+                do_segment = (t == 0) or (segment_every > 0 and t % segment_every == 0)
+                if self._segment_and_track and do_segment:
                     self.try_set_ZPosition(self._last_best_z[pos])
                     time.sleep(0.5)
                     self.try_set_config(self._channel_group_for_event(event), self._segment_channel)
@@ -1206,15 +1229,21 @@ class RamanEngine(MDAEngine):
                 if "z" in event.index
                 else 0.0
             )
-            self.try_set_ZPosition(
-                self._last_best_z[pos]
-                + relative_z
-                + self._channel_offset_for_event(event)
-            )
+            if not self._autofocus and event.sequence is not None and event.sequence.z_plan and not event.sequence.z_plan.is_relative:
+                self.try_set_ZPosition(event.z_pos)
+            else:
+                self.try_set_ZPosition(
+                    self._last_best_z[pos] + relative_z
+                    + self._channel_offset_for_event(event)
+                )
         elif event.z_pos is not None:
             self.try_set_ZPosition(
                 event.z_pos + self._channel_offset_for_event(event)
             )
+        # Internal focusing/segmentation may change channels. Restore the event's
+        # channel before collecting its camera image or spectrum.
+        if event.channel is not None:
+            self.try_set_config(event.channel.group, event.channel.config)
         if event.exposure is not None:
             self._mmc.setExposure(event.exposure)
         self._prepare_shutter_for_event(event)
@@ -1227,6 +1256,11 @@ class RamanEngine(MDAEngine):
             self._finish_shutter_for_event(event)
 
     def _exec_event(self, event: MDAEvent) -> Any:
+        if isinstance(event.action, HardwareAutofocus):
+            yield from super().exec_event(event)
+            return
+        if not isinstance(event.action, (AcquireImage, type(None))):
+            return
         is_raman_event = bool(
             self._rm_meta
             and (
@@ -1243,8 +1277,12 @@ class RamanEngine(MDAEngine):
             # its output; no camera snap or ImagePayload is produced.
             return
 
+        if not (getattr(self, "_autofocus", False) or getattr(self, "_segment_and_track", False)) and hasattr(self, "_z_correction"):
+            if not self._skip_imaging_for_same_pos or event.index.get("p", 0) in self._image_p:
+                yield from super().exec_event(event)
+            return
         if self._skip_imaging_for_same_pos:
-            if event.index["p"] in self._image_p:
+            if event.index.get("p", 0) in self._image_p:
                 self.try_snap_image()
 
                 meta = self.get_frame_metadata(event)
@@ -1269,5 +1307,6 @@ class RamanEngine(MDAEngine):
             # This is sequence cleanup, never per-event cleanup: all timepoints,
             # positions, channels, Z slices, and Raman points must finish first.
             # Apply BF after the base engine restores any initial hardware state.
-            self._mmc.setConfig("Channel", "BF")
-            self._mmc.waitForSystem()
+            if getattr(self, "_rm_meta", True) or "BF" in self._mmc.getAvailableConfigs(self._mmc.getChannelGroup() or "Channel"):
+                self._mmc.setConfig("Channel", "BF")
+                self._mmc.waitForSystem()

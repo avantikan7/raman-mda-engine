@@ -313,6 +313,8 @@ class RamanAcquisitionWriter:
         image_positions: Iterable[int] | None = None,
         batch: bool = False,
         overwrite: bool = False,
+        save_tracking_images: bool = True,
+        exact_path: bool = False,
     ) -> None:
         from pymmcore_plus import CMMCorePlus
 
@@ -330,6 +332,8 @@ class RamanAcquisitionWriter:
         )
         self._batch = bool(batch)
         self._overwrite = bool(overwrite)
+        self._save_tracking_images = bool(save_tracking_images)
+        self._exact_path = bool(exact_path)
         self._path: Path | None = None
         self._sequence: MDASequence | None = None
         self._image_sequence: MDASequence | None = None
@@ -402,11 +406,14 @@ class RamanAcquisitionWriter:
     def _on_mda_started(
         self, sequence: MDASequence, _summary_metadata: dict | None = None
     ) -> None:
-        self._path = (
-            _overwrite_folder(self._save_dir)
-            if self._overwrite
-            else _unique_folder(self._save_dir)
-        )
+        if self._overwrite:
+            self._path = _overwrite_folder(self._save_dir)
+        elif self._exact_path:
+            # The unified editor has already chosen and reviewed this destination.
+            self._path = self._save_dir.expanduser().resolve()
+            self._path.mkdir(parents=True, exist_ok=False)
+        else:
+            self._path = _unique_folder(self._save_dir)
         self._sequence = sequence
         self._status = "acquiring"
         self._closed = False
@@ -421,7 +428,8 @@ class RamanAcquisitionWriter:
 
         raman_meta = sequence.metadata.get("raman") or {}
         self._rm_channel = str(raman_meta.get("channel", "RM"))
-        position_count = max(1, len(sequence.stage_positions))
+        from .grid_plan import grid_count
+        position_count = max(1, grid_count(sequence))
         requested = self._requested_image_positions
         if requested is None:
             requested = tuple(range(position_count))
@@ -448,10 +456,20 @@ class RamanAcquisitionWriter:
             for channel in sequence.channels
             if channel.config != self._rm_channel
         )
-        if not camera_channels:
+        if not camera_channels or not self._image_positions:
             return None
 
         updates: dict[str, Any] = {"channels": camera_channels}
+        from .grid_plan import GRID_KEY, grid_position
+        if GRID_KEY in sequence.metadata:
+            updates["stage_positions"] = [
+                grid_position(sequence, index).replace(name=f"p{index:03d}")
+                for index in self._image_positions
+            ]
+            order = list(sequence.axis_order)
+            if "p" not in order:
+                order.insert(order.index("t") + 1 if "t" in order else 0, "p")
+            updates["axis_order"] = order
         if sequence.stage_positions:
             positions = []
             for original_index in self._image_positions:
@@ -461,6 +479,7 @@ class RamanAcquisitionWriter:
 
         metadata = dict(sequence.metadata)
         metadata.pop("raman", None)
+        metadata.pop(GRID_KEY, None)
         metadata["raman_storage"] = {
             "original_image_positions": list(self._image_positions)
         }
@@ -469,8 +488,16 @@ class RamanAcquisitionWriter:
 
     def _iter_image_events(self, sequence: MDASequence):
         selected = set(self._image_positions)
-        has_positions = bool(sequence.stage_positions)
-        for event in sequence.iter_events():
+        if not selected or not any(channel.config != self._rm_channel for channel in sequence.channels):
+            return
+        from .grid_plan import GRID_KEY, iter_grid_events
+        has_positions = bool(sequence.stage_positions) or GRID_KEY in sequence.metadata
+        # Validation must not advance the executed plan's autofocus state.
+        sequence = type(sequence).model_validate_json(sequence.model_dump_json())
+        for event in iter_grid_events(sequence):
+            from useq import AcquireImage
+            if not isinstance(getattr(event, "action", None), (AcquireImage, type(None))):
+                continue
             if event.channel is None or event.channel.config == self._rm_channel:
                 continue
             if has_positions and event.index.get("p", 0) not in selected:
@@ -588,13 +615,10 @@ class RamanAcquisitionWriter:
             / "aiming"
             / f"segment_p{p:03d}_t{t:03d}_z{z:03d}.npz"
         )
-        np.savez_compressed(
-            save_name,
-            img=image,
-            mask=mask,
-            new_pts=new_points,
-            prev_aim=previous_points,
-        )
+        payload = dict(mask=mask, new_pts=new_points, prev_aim=previous_points)
+        if self._save_tracking_images:
+            payload["img"] = image
+        np.savez_compressed(save_name, **payload)
 
     def _stage_xyz_um(self) -> tuple[float, float, float]:
         try:
