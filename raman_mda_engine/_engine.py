@@ -659,6 +659,17 @@ class RamanEngine(MDAEngine):
             elif hasattr(source, "_points"):
                 update_pos_points(pos, source_points, source._points)
     def reload(self, N=100):
+        # Emit stop events before disconnecting live-view handlers or devices.
+        from pymmcore_plus import DeviceType
+
+        errors = []
+        for camera in self._mmc.getLoadedDevicesOfType(DeviceType.CameraDevice):
+            try:
+                self._mmc.stopSequenceAcquisition(camera)
+            except Exception as error:
+                errors.append(f"{camera}: {error}")
+        if errors:
+            raise RuntimeError("Could not stop live acquisitions: " + "; ".join(errors))
         # Give transient camera/device errors time to clear before tearing down
         # and rebuilding the entire Micro-Manager hardware configuration.
         n = self._RELOAD_INITIAL_DELAY_S

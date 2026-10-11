@@ -27,6 +27,7 @@ def test_engine_stores_segmentation_circle_radius(core: CMMCorePlus):
 def test_reload_waits_before_unloading_devices():
     engine = object.__new__(RamanEngine)
     engine._mmc = MagicMock()
+    engine._mmc.getLoadedDevicesOfType.return_value = ["Camera1", "Camera2"]
     engine._config_file = "hardware.cfg"
     engine.try_set_config = MagicMock()
 
@@ -35,6 +36,22 @@ def test_reload_waits_before_unloading_devices():
 
     sleep.assert_called_once_with(5.0)
     engine._mmc.unloadAllDevices.assert_called_once_with()
+    calls = engine._mmc.mock_calls
+    for camera in ("Camera1", "Camera2"):
+        assert calls.index(call.stopSequenceAcquisition(camera)) < calls.index(
+            call.events.channelGroupChanged.disconnect()
+        )
+
+
+def test_reload_does_not_unload_if_live_acquisition_cannot_stop():
+    engine = object.__new__(RamanEngine)
+    engine._mmc = MagicMock()
+    engine._mmc.getLoadedDevicesOfType.return_value = ["Camera1", "Camera2"]
+    engine._mmc.stopSequenceAcquisition.side_effect = [RuntimeError("busy"), None]
+    with pytest.raises(RuntimeError, match="Camera1: busy"):
+        engine.reload(N=1)
+    assert engine._mmc.stopSequenceAcquisition.call_count == 2
+    engine._mmc.unloadAllDevices.assert_not_called()
 
 
 def test_record_raman_combines_named_cell_layers_and_skips_empty_layers():
