@@ -101,6 +101,7 @@ class RamanEngine(MDAEngine):
         cell_diameter=15,
         point_repeats=1,
         segment_every=None,
+        autofocus_axes=("p", "t"),
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -187,6 +188,7 @@ class RamanEngine(MDAEngine):
         self._fine_search_range = fine_search_range
         self._fine_search_pts = fine_search_pts
         self._refocus_every = max(0, int(refocus_every))
+        self._autofocus_axes = tuple(autofocus_axes)
         self._segment_every = self._refocus_every if segment_every is None else max(0, int(segment_every))
         self._config_file = config_file
         # image dimensions in pixels (X = 1344, Y = 1024 by default)
@@ -553,6 +555,8 @@ class RamanEngine(MDAEngine):
         # even with a single position. (-1, -1) is a sentinel that never matches.
         self._last_pos = (-1, -1)
         self._updated_positions = set()
+        self._autofocus_previous_index = {}
+        self._autofocus_pending = False
         self._last_best_z = {}
         self._last_images = {}
         self._tracks = {}
@@ -1177,6 +1181,28 @@ class RamanEngine(MDAEngine):
         return focusZ, max_laser_offset+focusZ, coarse_raman
 
 
+    def _autofocus_due(self, event):
+        """Apply the selected axis triggers and timepoint cadence to imaging events."""
+        current = dict(event.index)
+        previous = getattr(self, "_autofocus_previous_index", {})
+        self._autofocus_previous_index = current
+        axes = getattr(self, "_autofocus_axes", ("p", "t"))
+        # Dense Raman grids expose each tile as p rather than native g.
+        if "g" in axes and event.sequence and "raman_grid" in event.sequence.metadata:
+            axes = (*axes, "p")
+        changed = bool(axes) and (not previous or any(
+            axis in current and current[axis] != previous.get(axis) for axis in axes
+        ))
+        t = current.get("t", 0)
+        cadence = t == 0 or (self._refocus_every > 0 and t % self._refocus_every == 0)
+        pending = getattr(self, "_autofocus_pending", False) or changed
+        self._autofocus_pending = bool(self._autofocus and axes and cadence and pending)
+        eligible = getattr(self, "_autofocus_p", None)
+        if self._autofocus_pending and (eligible is None or current.get("p", 0) in eligible):
+            self._autofocus_pending = False
+            return True
+        return False
+
     def event_iterator(self, events):
         # Raman/target operations are per event and cannot use camera hardware batches.
         from .grid_plan import iter_grid_events
@@ -1216,15 +1242,14 @@ class RamanEngine(MDAEngine):
             updated = getattr(self, "_updated_positions", None)
             if updated is None:
                 updated = self._updated_positions = set()
-            if (t, pos) not in updated:
+            first_visit = (t, pos) not in updated
+            do_refocus = self._autofocus_due(event)
+            if first_visit or do_refocus:
                 updated.add((t, pos))
                 self._last_pos = (t, pos)
                 # Do we refresh focus / aiming on THIS timepoint?
                 # t == 0 always runs (need a baseline mask + z per position);
                 # after that, 0 disables updates; positive values set the cadence.
-                do_refocus = (t == 0) or (
-                    self._refocus_every > 0 and t % self._refocus_every == 0
-                )
                 # ---- Baseline best-z for this position ----
                 if self._last_best_z.get(pos) is None:
                     if not self._autofocus or pos in self._autofocus_p or not self._last_best_z:
@@ -1276,7 +1301,7 @@ class RamanEngine(MDAEngine):
                 # ---- Step 2: aiming update ----
                 segment_every = getattr(self, "_segment_every", self._refocus_every)
                 do_segment = (t == 0) or (segment_every > 0 and t % segment_every == 0)
-                if self._segment_and_track and do_segment:
+                if self._segment_and_track and do_segment and first_visit:
                     self.try_set_ZPosition(self._last_best_z[pos])
                     time.sleep(0.5)
                     self.try_set_config(self._channel_group_for_event(event), self._segment_channel)

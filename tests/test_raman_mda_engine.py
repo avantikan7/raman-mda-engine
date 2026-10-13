@@ -263,6 +263,7 @@ def test_refocus_cadence_preserves_initial_focus_and_segmentation(cadence, segme
     engine._autofocus = True
     engine._segment_and_track = True
     engine._refocus_every = cadence
+    engine._autofocus_due = lambda event: RamanEngine._autofocus_due(engine, event)
     if segment_every is not None:
         engine._segment_every = segment_every
     engine._last_pos = None
@@ -550,3 +551,44 @@ def test_mda_no_autofocus(core: CMMCorePlus, engine: RamanEngine):
 
 
 # TODO: test with autofocus!!
+
+
+@pytest.mark.parametrize("axes, expected", [
+    ((), [False, False, False, False, False]),
+    (("p",), [True, False, True, True, True]),
+    (("t",), [True, False, False, True, False]),
+    (("p", "t"), [True, False, True, True, True]),
+])
+def test_laser_autofocus_axis_triggers(axes, expected):
+    engine = object.__new__(RamanEngine)
+    engine._autofocus = True
+    engine._autofocus_axes = axes
+    engine._refocus_every = 1
+    events = [MDAEvent(index=index) for index in (
+        {"p": 0, "t": 0, "c": 0}, {"p": 0, "t": 0, "c": 1},
+        {"p": 1, "t": 0}, {"p": 0, "t": 1}, {"p": 1, "t": 1})]
+    assert [engine._autofocus_due(event) for event in events] == expected
+
+
+def test_grid_autofocus_axes_and_initial_only_cadence():
+    engine = object.__new__(RamanEngine)
+    engine._autofocus = True
+    engine._autofocus_axes = ("g",)
+    engine._refocus_every = 0
+    seq = MDASequence(metadata={"raman_grid": {}})
+    events = [MDAEvent(index={"p": p, "t": t}, sequence=seq)
+              for t in range(2) for p in range(2)]
+    assert [engine._autofocus_due(event) for event in events] == [True, True, False, False]
+    engine._refocus_every = 2
+    event = MDAEvent(index={"p": 0, "t": 2}, sequence=seq)
+    assert engine._autofocus_due(event)
+
+
+def test_time_axis_waits_for_an_eligible_autofocus_position():
+    engine = object.__new__(RamanEngine)
+    engine._autofocus = True
+    engine._autofocus_axes = ("t",)
+    engine._autofocus_p = [1]
+    engine._refocus_every = 1
+    events = [MDAEvent(index={"p": p, "t": t}) for t in range(2) for p in range(3)]
+    assert [engine._autofocus_due(event) for event in events] == [False, True, False] * 2
