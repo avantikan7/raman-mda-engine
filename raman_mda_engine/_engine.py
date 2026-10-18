@@ -472,9 +472,14 @@ class RamanEngine(MDAEngine):
                 volts, self._default_rm_exp
             )
         else:
-            spec = np.concatenate([np.atleast_2d(self._spectra_collector.collect_spectra_pts_batch(
-                volts, self._default_rm_exp
-            )) for _ in range(point_repeats)], axis=0)
+            spectra = []
+            for _ in range(point_repeats):
+                spectrum = np.atleast_2d(self._spectra_collector.collect_spectra_pts_batch(
+                    volts, self._default_rm_exp))
+                if spectrum.ndim != 2 or spectrum.shape[0] != 1:
+                    raise RuntimeError("Integrated batch collector must return one spectrum per repeat")
+                spectra.append(spectrum)
+            spec = np.concatenate(spectra, axis=0)
         # print(f"Collecting Raman took {time.perf_counter() - st} s")
         # st = time.perf_counter()
         if hasattr(self, "_mmc"):
