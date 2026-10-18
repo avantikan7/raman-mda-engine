@@ -314,6 +314,34 @@ def test_refocus_cadence_preserves_initial_focus_and_segmentation(cadence, segme
     assert engine.try_set_config.call_args == call("Channel", "GFP")
 
 
+def test_plate_focus_baseline_precedes_autofocus_and_is_not_inherited():
+    engine = MagicMock(spec=RamanEngine)
+    engine._mmc = MagicMock()
+    engine._autofocus = True
+    engine._segment_and_track = False
+    engine._refocus_every = 1
+    engine._autofocus_due = lambda event: RamanEngine._autofocus_due(engine, event)
+    engine._last_best_z = {}
+    engine._autofocus_p = [0]
+    engine._z_rel = [5]
+    engine._channel_offset_for_event.return_value = 2
+    source = MagicMock()
+    source.role = "autofocus"
+    source.get_mda_points.return_value = [[512, 512]]
+    engine.aiming_sources = [source]
+    engine.autofocus_w_raman.return_value = (None, 103, None)
+    sequence = MDASequence(metadata={"plate_focus_height_applied": True})
+    for pos, z in [(0, 107), (1, 207)]:
+        RamanEngine.setup_event(engine, MDAEvent(sequence=sequence,
+            index={"p": pos, "t": 0, "z": 0}, x_pos=pos*100, y_pos=0, z_pos=z))
+    assert engine._last_best_z == {0: 103, 1: 200}
+    assert engine.autofocus_w_raman.call_args.args[0] == 100
+    calls = engine.mock_calls
+    move = calls.index(call.try_set_ZPosition(100))
+    autofocus = next(i for i, c in enumerate(calls) if c[0] == "autofocus_w_raman")
+    assert move < autofocus
+
+
 def test_setup_event_holds_shutter_open_when_requested():
     engine = object.__new__(RamanEngine)
     engine._mmc = MagicMock()
@@ -329,6 +357,54 @@ def test_setup_event_holds_shutter_open_when_requested():
     engine._mmc.setAutoShutter.assert_called_once_with(False)
     engine._mmc.setShutterOpen.assert_called_once_with(True)
     engine._mmc.waitForSystem.assert_called_once_with()
+
+
+@pytest.mark.parametrize("candidate", ["No sufficiently large patch", None])
+def test_automatic_selection_uses_scheduled_images_without_extra_snaps(candidate):
+    from raman_mda_engine.autofocus_selection import FocusCandidate, AcquisitionFocusSelection
+    from pymmcore_plus.mda._engine import ImagePayload
+    engine = MagicMock(spec=RamanEngine)
+    engine._mmc = MagicMock()
+    engine._autofocus = True
+    engine._automatic_af_positions = True
+    engine._automatic_af_min_radius = 20
+    engine._automatic_af_selection = AcquisitionFocusSelection()
+    engine._image_x = 256
+    engine._image_y = 128
+    engine._segment_and_track = False
+    engine._refocus_every = 0
+    engine._autofocus_due = lambda e: RamanEngine._autofocus_due(engine,e)
+    engine._autofocus_from_acquired_image = lambda e,im: RamanEngine._autofocus_from_acquired_image(engine,e,im)
+    engine._last_best_z = {}
+    engine._autofocus_p = [0]
+    engine._z_rel = [0]
+    engine._channel_offset_for_event.return_value = 0
+    engine.aiming_sources = []
+    engine.autofocus_w_raman.return_value = (100,101,None)
+    seq = MDASequence(channels=["BF","GFP"], stage_positions=[(0,0,100)],
+                       metadata={"autofocus_stage_xy":{"0":[999,999]}})
+    with patch("raman_mda_engine.autofocus_selection.find_empty_patch",
+               return_value=FocusCandidate(180,70,25),
+               side_effect=ValueError(candidate) if candidate else None) as detect:
+        for event in seq:
+            RamanEngine.setup_event(engine,event)
+            assert engine.autofocus_w_raman.call_count == 0
+            payload = ImagePayload(image=np.ones((128,256)),event=event,metadata={"z":100})
+            engine._exec_event.return_value = iter([payload])
+            emitted = list(RamanEngine.exec_event(engine,event))
+            assert emitted == [payload]
+            assert emitted[0].metadata["z"] == 100
+        assert detect.call_count == 1
+    engine.try_snap_image.assert_not_called()
+    engine._mmc.snap.assert_not_called()
+    if candidate:
+        engine.autofocus_w_raman.assert_not_called()
+        assert engine._last_best_z[0] == 100
+    else:
+        engine.autofocus_w_raman.assert_called_once()
+        np.testing.assert_allclose(engine.autofocus_w_raman.call_args.args[1] * [256,128], [70,180])
+        assert engine.autofocus_w_raman.call_args.kwargs == {}
+        assert engine._last_best_z[0] == 101
 
 
 @pytest.mark.parametrize("config_driven", [False, True])

@@ -102,6 +102,8 @@ class RamanEngine(MDAEngine):
         point_repeats=1,
         segment_every=None,
         autofocus_axes=("p", "t"),
+        automatic_af_positions=False,
+        automatic_af_min_radius=20.0,
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.
@@ -192,6 +194,8 @@ class RamanEngine(MDAEngine):
         self._fine_search_pts = fine_search_pts
         self._refocus_every = max(0, int(refocus_every))
         self._autofocus_axes = tuple(autofocus_axes)
+        self._automatic_af_positions = automatic_af_positions
+        self._automatic_af_min_radius = automatic_af_min_radius
         self._segment_every = self._refocus_every if segment_every is None else max(0, int(segment_every))
         self._config_file = config_file
         # image dimensions in pixels (X = 1344, Y = 1024 by default)
@@ -575,6 +579,8 @@ class RamanEngine(MDAEngine):
         self._updated_positions = set()
         self._autofocus_previous_index = {}
         self._autofocus_pending = False
+        from .autofocus_selection import AcquisitionFocusSelection
+        self._automatic_af_selection = AcquisitionFocusSelection()
         self._last_best_z = {}
         self._last_images = {}
         self._tracks = {}
@@ -1329,6 +1335,9 @@ class RamanEngine(MDAEngine):
                 updated = self._updated_positions = set()
             first_visit = (t, pos) not in updated
             do_refocus = self._autofocus_due(event)
+            automatic = getattr(self, "_automatic_af_positions", False)
+            if automatic and do_refocus:
+                self._automatic_af_selection.request(event)
             if first_visit or do_refocus:
                 updated.add((t, pos))
                 self._last_pos = (t, pos)
@@ -1337,7 +1346,8 @@ class RamanEngine(MDAEngine):
                 # after that, 0 disables updates; positive values set the cadence.
                 # ---- Baseline best-z for this position ----
                 if self._last_best_z.get(pos) is None:
-                    if not self._autofocus or pos in self._autofocus_p or not self._last_best_z:
+                    plate_focus = bool(event.sequence and event.sequence.metadata.get("plate_focus_height_applied"))
+                    if plate_focus or not self._autofocus or pos in self._autofocus_p or not self._last_best_z:
                         # autofocus position (or the very first position):
                         # trust the sequence z as the starting point
                         base = event.z_pos
@@ -1359,7 +1369,7 @@ class RamanEngine(MDAEngine):
                 else:
                     self.try_set_ZPosition(self._last_best_z[pos])
                 # ---- Step 1: autofocus ----
-                if self._autofocus and do_refocus and pos in self._autofocus_p:
+                if self._autofocus and do_refocus and pos in self._autofocus_p and not automatic:
                     points = None
                     autofocus_source_found = False
                     for source in self.aiming_sources:
@@ -1379,7 +1389,7 @@ class RamanEngine(MDAEngine):
                         pt = np.array(points[0])
                         print('-----------Autofocusing-----------')
                         stage_xy = (event.sequence.metadata.get("autofocus_stage_xy", {}).get(str(pos))
-                                    if event.sequence else None)
+                                    if event.sequence and not automatic else None)
                         _, self._bestZ, _ = self.autofocus_w_raman(
                             self._last_best_z[pos], pt, t, pos,
                             **({"stage_xy": stage_xy} if stage_xy is not None else {})
@@ -1434,13 +1444,39 @@ class RamanEngine(MDAEngine):
         # st = time.perf_counter()
     def exec_event(self, event: MDAEvent) -> Any:
         completed = False
+        payload = None
         try:
-            yield from self._exec_event(event)
+            for payload in self._exec_event(event):
+                yield payload
             completed = True
         finally:
             self._finish_shutter_for_event(
                 event if completed else event.model_copy(update={"keep_shutter_open": False})
             )
+        if completed and payload is not None and getattr(self, "_automatic_af_positions", False):
+            self._autofocus_from_acquired_image(event, payload.image)
+
+    def _autofocus_from_acquired_image(self, event, image):
+        result = self._automatic_af_selection.consume(event, image, self._automatic_af_min_radius)
+        if result is None:
+            return
+        pos, t = event.index.get("p", 0), event.index.get("t", 0)
+        if isinstance(result, str):
+            logger.info("Skipping automatic autofocus at position {}: {}", pos, result)
+            return
+        if image.shape != (self._image_y, self._image_x):
+            logger.warning("Skipping automatic autofocus: image size differs from calibrated camera field")
+            return
+        point = np.array([result.y / self._image_x, result.x / self._image_y])
+        logger.info("Automatic autofocus position {}: pixel ({}, {}), empty patch radius {:.1f} px",
+                    pos, result.x, result.y, result.radius_px)
+        # Acquisition frames have already been delivered with their original Z metadata.
+        # The new baseline affects subsequent events; do not recapture earlier images.
+        baseline = self._last_best_z[pos]
+        self.try_set_ZPosition(baseline)
+        _, self._bestZ, _ = self.autofocus_w_raman(baseline, point, t, pos)
+        self._last_best_z[pos] = self._bestZ
+        self.try_set_ZPosition(self._bestZ)
 
     def _exec_event(self, event: MDAEvent) -> Any:
         if isinstance(event.action, HardwareAutofocus):
