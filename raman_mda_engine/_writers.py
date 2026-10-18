@@ -30,12 +30,15 @@ __all__ = [
     "RamanTiffAndNumpyWriter",
 ]
 
-_RAMAN_SCHEMA_VERSION = 1
+_RAMAN_SCHEMA_VERSION = 2
 _EVENT_DTYPE = np.dtype(
     [
         ("t", "<i8"),
         ("p", "<i8"),
         ("z", "<i8"),
+        ("c", "<i8"),
+        ("batch", "?"),
+        ("repeats", "<i8"),
         ("timestamp_ns", "<i8"),
         ("exposure_ms", "<f8"),
         ("stage_xyz_um", "<f8", (3,)),
@@ -160,6 +163,7 @@ class _RamanH5Store:
         )
 
         raman = self._file.create_group("raman")
+        raman.create_dataset("repeat_index", shape=(0,), maxshape=(None,), chunks=(256,), dtype="<i8")
         raman.create_dataset(
             "points_yx",
             shape=(0, 2),
@@ -279,6 +283,15 @@ class _RamanH5Store:
         record["t"] = event.index.get("t", 0)
         record["p"] = event.index.get("p", 0)
         record["z"] = event.index.get("z", 0)
+        record["c"] = event.index.get("c", 0)
+        policy = (event.sequence.metadata.get("raman_positions", {}).get(str(event.index.get("p", 0)), {})
+                  if event.sequence else {})
+        record["batch"] = policy.get("mode") == "integrated_batch" if policy else bool(self._file.attrs["batch"])
+        record["repeats"] = (event.sequence.metadata.get("raman", {}).get("frames_per_point", 1)
+                             if event.sequence else 1)
+        repeats_ds = self._file["raman/repeat_index"]
+        repeats_ds.resize(spectra_start + len(spectra), axis=0)
+        repeats_ds[spectra_start:] = np.arange(len(spectra)) % max(1, int(record["repeats"][0]))
         record["timestamp_ns"] = int(datetime.now(timezone.utc).timestamp() * 1e9)
         record["exposure_ms"] = float(exposure_ms)
         record["stage_xyz_um"] = stage_xyz_um
@@ -439,6 +452,10 @@ class RamanAcquisitionWriter:
         source_positions = _image_source_positions(
             position_count, self._image_positions
         )
+        if "raman_positions" in sequence.metadata:
+            camera_enabled = any(c.config != self._rm_channel for c in sequence.channels)
+            source_positions = np.array([p if camera_enabled and p in self._image_positions else -1
+                                         for p in range(position_count)], dtype=np.int64)
         self._raman_store = _RamanH5Store(
             self._path / "raman.h5",
             sequence_json=sequence_json,
@@ -639,13 +656,18 @@ class RamanAcquisitionWriter:
         if self._closed or self._raman_store is None:
             return
         try:
+            policy = (event.sequence.metadata.get("raman_positions", {}).get(str(event.index.get("p", 0)), {})
+                      if event.sequence else {})
+            if policy:
+                shape = np.asarray(policy["image_shape"], dtype=float)
+                points = np.asarray(points) * shape / shape[::-1]
             self._raman_store.append(
                 event,
                 spectra,
                 points,
                 designations,
                 exposure_ms,
-                self._stage_xyz_um(),
+                event.metadata["raman_stage_xyz_um"] if "raman_stage_xyz_um" in event.metadata else self._stage_xyz_um(),
             )
         except Exception:
             self._status = "failed"

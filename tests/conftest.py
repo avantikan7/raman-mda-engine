@@ -17,7 +17,7 @@ def core() -> CMMCorePlus:
 
 @pytest.fixture
 def engine(core: CMMCorePlus) -> RamanEngine:
-    engine = RamanEngine(spectra_collector=fakeAcquirer())
+    engine = RamanEngine(spectra_collector=fakeAcquirer(), batch=True)
     engine.aiming_sources.append(SimpleGridSource(5, 5))
     core.register_mda_engine(engine)
     return engine

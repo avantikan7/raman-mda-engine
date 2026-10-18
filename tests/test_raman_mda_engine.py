@@ -73,9 +73,9 @@ def test_record_raman_combines_named_cell_layers_and_skips_empty_layers():
     engine._max_volt = 1.6
     engine._default_rm_exp = 100
     engine.aiming_sources = [
-        _Source("cell:Type A", [[0.1, 0.2], [0.3, 0.4]]),
+        _Source("cell:Type A", [[0.5, 0.5], [0.5, 0.5]]),
         _Source("cell:Empty", []),
-        _Source("cell:Type B", [[0.5, 0.6]]),
+        _Source("cell:Type B", [[0.5, 0.5]]),
     ]
     engine.try_set_config = MagicMock()
     engine._transformer = MagicMock()
@@ -97,12 +97,12 @@ def test_record_raman_combines_named_cell_layers_and_skips_empty_layers():
     np.testing.assert_allclose(
         emitted[2],
         [
-            [0.1, 0.2],
-            [0.1, 0.2],
-            [0.3, 0.4],
-            [0.3, 0.4],
-            [0.5, 0.6],
-            [0.5, 0.6],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            [0.5, 0.5],
         ],
     )
     assert emitted[3] == [
@@ -141,7 +141,8 @@ def test_laser_autofocus_stage_positions_use_pixel_to_stage_model():
     assert target == (950, 2010)
 
 
-def test_laser_autofocus_centers_galvo_and_restores_stage():
+@pytest.mark.parametrize("stage_xy, expected", [(None, (950.0, 2010.0)), ([77, 88], (77, 88))])
+def test_laser_autofocus_centers_galvo_and_restores_stage(stage_xy, expected):
     engine = object.__new__(RamanEngine)
     engine._autofocus_object = "laser"
     engine._autofocus_search_range = 2
@@ -187,6 +188,7 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
             pt=np.array([40 / 200, 150 / 100]),
             t=0,
             p=0,
+            stage_xy=stage_xy,
         )
 
     engine._transformer.BF_to_volts.assert_called_once()
@@ -202,11 +204,11 @@ def test_laser_autofocus_centers_galvo_and_restores_stage():
         np.array([[0.2, -0.3], [0.2, -0.3]]),
     )
     assert stage_settling.set_xy.call_args_list == [
-        call(950.0, 2010.0),
+        call(*expected),
         call(1000.0, 2000.0),
     ]
     assert stage_settling.mock_calls[:2] == [
-        call.set_xy(950.0, 2010.0),
+        call.set_xy(*expected),
         call.sleep(0.1),
     ]
     assert engine.try_set_config.call_args_list == [

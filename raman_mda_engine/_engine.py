@@ -156,6 +156,8 @@ class RamanEngine(MDAEngine):
         # None. Resolve the singleton before calling the base constructor.
         mmc = mmc or CMMCorePlus.instance()
         super().__init__(mmc)
+        # Keep our hardware handle independent of the base engine's private name.
+        self._mmc = mmc
         self.raman_events = RamanSignaler()
         self._rng = np.random.default_rng()
         self._img_gen: ImageGenerator | None = None
@@ -393,6 +395,9 @@ class RamanEngine(MDAEngine):
             else:
                 return pts
         p, t = event.index["p"], event.index.get("t", 0)
+        policy = (event.sequence.metadata.get("raman_positions", {}).get(str(p), {})
+                  if event.sequence else {})
+        batch = policy.get("mode") == "integrated_batch" if policy else self._batch
         logger.info(f"collecting raman: {p=}, {t=}")
         points = []
         which = []
@@ -402,7 +407,7 @@ class RamanEngine(MDAEngine):
             new_points = source.get_mda_points(event)
             if len(new_points) == 0:
                 continue
-            if self._batch and self._segment_and_track:
+            if batch and self._segment_and_track:
                 xy = (np.array(new_points)*[self._image_x, self._image_y])/self._scale
                 mask = self._last_segments[p]
                 cell_id = mask[*np.mean(xy, axis=0).astype(int)]
@@ -423,8 +428,11 @@ class RamanEngine(MDAEngine):
             )
             return
         points = np.vstack(points)
+        if not batch and not np.allclose(
+                points * [self._image_x, self._image_y] / [self._image_y, self._image_x], 0.5):
+            raise ValueError("Non-batch Raman requires centered stage positions. Apply Raman selections before acquisition.")
         point_repeats = getattr(self, "_point_repeats", 1)
-        if point_repeats > 1:
+        if point_repeats > 1 and not batch:
             points = np.repeat(points, point_repeats, axis=0)
             which = [name for name in which for _ in range(point_repeats)]
         # print(f"Before RM channel took {time.perf_counter() - st} s")
@@ -459,16 +467,20 @@ class RamanEngine(MDAEngine):
             )
         if pre_acq:
             _ = self._spectra_collector.collect_spectra_pts(np.tile(volts[0], (2, 1)), 100)
-        if not self._batch:
+        if not batch:
             spec = self._spectra_collector.collect_spectra_pts(
                 volts, self._default_rm_exp
             )
         else:
-            spec = self._spectra_collector.collect_spectra_pts_batch(
+            spec = np.concatenate([np.atleast_2d(self._spectra_collector.collect_spectra_pts_batch(
                 volts, self._default_rm_exp
-            )
+            )) for _ in range(point_repeats)], axis=0)
         # print(f"Collecting Raman took {time.perf_counter() - st} s")
         # st = time.perf_counter()
+        if hasattr(self, "_mmc"):
+            x, y = self._mmc.getXYPosition()
+            event = event.model_copy(update={"metadata": {**event.metadata,
+                "raman_stage_xyz_um": [float(x), float(y), float(self._mmc.getZPosition())]}})
         self.raman_events.ramanSpectraReady.emit(event, spec, points, which, self._default_rm_exp)
     @slack_notify
     def snap_raman(
@@ -958,7 +970,19 @@ class RamanEngine(MDAEngine):
         target_xy = original_xy - stage_offset
         return tuple(original_xy), tuple(target_xy)
 
-    def autofocus_w_raman(self, last_z, pt, t, p, max_volt=1.6):
+    def autofocus_w_raman(self, last_z, pt, t, p, max_volt=1.6, stage_xy=None):
+        if stage_xy is not None and self._autofocus_object != "laser":
+            xy = np.asarray(stage_xy, dtype=float)
+            if xy.shape != (2,) or not np.isfinite(xy).all():
+                raise ValueError("Autofocus reference needs finite stage XY coordinates")
+            original_xy = tuple(self.try_get_XYPosition())
+            try:
+                self.try_set_XYPosition(*xy)
+                center = np.array([self._image_y / 2 / self._image_x,
+                                   self._image_x / 2 / self._image_y])
+                return self.autofocus_w_raman(last_z, center, t, p, max_volt)
+            finally:
+                self.try_set_XYPosition(*original_xy)
         focusZ = self.try_get_ZPosition()
         object = self._autofocus_object
         shutter = self._shutter_device or "Fluoshutter"
@@ -1092,9 +1116,13 @@ class RamanEngine(MDAEngine):
                 np.array([[0.5, 0.5]]),
                 max_volts=self._max_volt,
             )
-            original_xy, autofocus_xy = (
-                self._laser_autofocus_stage_positions(pt)
-            )
+            if stage_xy is None:
+                original_xy, autofocus_xy = self._laser_autofocus_stage_positions(pt)
+            else:
+                original_xy = tuple(self.try_get_XYPosition())
+                autofocus_xy = np.asarray(stage_xy, dtype=float)
+                if autofocus_xy.shape != (2,) or not np.isfinite(autofocus_xy).all():
+                    raise ValueError("Autofocus reference needs finite stage XY coordinates")
             print(
                 "[laser autofocus] centering with stage: "
                 f"XY {original_xy} -> {autofocus_xy}"
@@ -1293,8 +1321,11 @@ class RamanEngine(MDAEngine):
                     else:
                         pt = np.array(points[0])
                         print('-----------Autofocusing-----------')
+                        stage_xy = (event.sequence.metadata.get("autofocus_stage_xy", {}).get(str(pos))
+                                    if event.sequence else None)
                         _, self._bestZ, _ = self.autofocus_w_raman(
-                            self._last_best_z[pos], pt, t, pos
+                            self._last_best_z[pos], pt, t, pos,
+                            **({"stage_xy": stage_xy} if stage_xy is not None else {})
                         )
                         print(f'autofocus z = {self._bestZ}')
                         self._last_best_z[pos] = self._bestZ
