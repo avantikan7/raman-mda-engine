@@ -14,10 +14,12 @@ __all__ = [
 
 
 class RamanSignaler:
+    autofocusFinished = Psygnal(object)
     ramanSpectraReady = Psygnal(MDAEvent, np.ndarray, np.ndarray, List[str], float)
     aimUpdated = Psygnal(MDAEvent, np.ndarray, np.ndarray, np.ndarray, np.ndarray)
 
 
 class QRamanSignaler(QObject):
+    autofocusFinished = Signal(object)
     ramanSpectraReady = Signal(object, object, object, object, object)
     aimUpdated = Signal(object, object, object, object, object)

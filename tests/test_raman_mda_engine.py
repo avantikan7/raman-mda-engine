@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
@@ -141,14 +142,17 @@ def test_laser_autofocus_stage_positions_use_pixel_to_stage_model():
     assert target == (950, 2010)
 
 
+@pytest.mark.parametrize("peak_offset", [-30, 0, 30])
+@pytest.mark.parametrize("flat_signal", [False, True])
 @pytest.mark.parametrize("stage_xy, expected", [(None, (950.0, 2010.0)), ([77, 88], (77, 88))])
-def test_laser_autofocus_centers_galvo_and_restores_stage(stage_xy, expected):
+def test_laser_autofocus_centers_galvo_and_restores_stage(stage_xy, expected, flat_signal, peak_offset):
     engine = object.__new__(RamanEngine)
     engine._autofocus_object = "laser"
+    engine.raman_events = MagicMock()
     engine._autofocus_search_range = 2
-    engine._search_pts = 2
+    engine._search_pts = 3
     engine._fine_search_range = 1
-    engine._fine_search_pts = 2
+    engine._fine_search_pts = 3
     engine._shutter_device = None
     engine._max_volt = 1.6
     engine._image_x = 200
@@ -176,14 +180,18 @@ def test_laser_autofocus_centers_galvo_and_restores_stage(stage_xy, expected):
     engine.try_set_ZPosition = MagicMock()
     engine.try_set_config = MagicMock()
     engine.try_setExp = MagicMock()
-    engine.try_snap = MagicMock(return_value=np.ones((3, 4)))
+    engine.try_snap = MagicMock(side_effect=lambda: np.full(
+        (3, 4), 1e6 * np.exp(-(engine.try_set_ZPosition.call_args.args[0] - 10 - peak_offset) ** 2 / 100)
+    ))
     engine._set_focus_filter = MagicMock()
+    if flat_signal:
+        engine.try_snap.side_effect = lambda: np.ones((3, 4))
 
-    with patch(
+    with (pytest.raises(RuntimeError, match="flat") if flat_signal else nullcontext()), patch(
         "raman_mda_engine._engine.time.sleep",
         new=stage_settling.sleep,
     ):
-        engine.autofocus_w_raman(
+        returned = engine.autofocus_w_raman(
             last_z=10,
             pt=np.array([40 / 200, 150 / 100]),
             t=0,
@@ -191,6 +199,20 @@ def test_laser_autofocus_centers_galvo_and_restores_stage(stage_xy, expected):
             stage_xy=stage_xy,
         )
 
+    result = engine.raman_events.autofocusFinished.emit.call_args.args[0]
+    assert result["start_z"] == 10
+    assert len(result["samples"]) >= (3 if flat_signal else 6)
+    assert all(-35 <= sample["z"] <= 55 for sample in result["samples"])
+    assert result["samples"][0]["phase"] == "coarse"
+    assert result["best_z"] == (None if flat_signal else 10 + peak_offset)
+    assert bool(result["error"]) == flat_signal
+    if not flat_signal:
+        assert returned[1] == 10 + peak_offset
+        fine_z = [s["z"] for s in result["samples"] if s["phase"] == "fine"]
+        np.testing.assert_allclose(fine_z, np.arange(8, 12.5, 0.5) + peak_offset)
+        assert result["samples"][-1]["phase"] == "fine"
+    if flat_signal:
+        engine.try_set_ZPosition.assert_called_with(10)
     engine._transformer.BF_to_volts.assert_called_once()
     np.testing.assert_array_equal(
         engine._transformer.BF_to_volts.call_args.args[0],
@@ -224,7 +246,6 @@ def test_laser_autofocus_centers_galvo_and_restores_stage(stage_xy, expected):
         call(True),
     ]
     assert engine.try_setExp.call_args_list == [
-        call(0.1),
         call(0.1),
         call(10.0),
     ]
@@ -594,3 +615,117 @@ def test_time_axis_waits_for_an_eligible_autofocus_position():
     engine._refocus_every = 1
     events = [MDAEvent(index={"p": p, "t": t}) for t in range(2) for p in range(3)]
     assert [engine._autofocus_due(event) for event in events] == [False, True, False] * 2
+
+
+@pytest.mark.parametrize("peak", [-4.0, 0.0, 4.0])
+def test_laser_peak_extends_until_bracketed(peak):
+    engine = object.__new__(RamanEngine)
+    engine._last_operation_reloaded = False
+    engine.try_set_ZPosition = MagicMock()
+    engine.try_snap = MagicMock(side_effect=lambda: np.full(
+        (3, 4), 1e6 * np.exp(-(engine.try_set_ZPosition.call_args.args[0] - peak) ** 2)
+    ))
+    assert engine._laser_focus_peak(0, 2, 5, -6, 6) == peak
+    positions = [c.args[0] for c in engine.try_set_ZPosition.call_args_list]
+    assert min(positions) < peak < max(positions)
+    assert len(positions) == len(set(positions))
+    assert min(positions) >= -6 and max(positions) <= 6
+    assert min(positions) == -max(positions)
+    if peak:
+        assert positions[5:] == [-3, 3, -4, 4, -5, 5]
+
+
+@pytest.mark.parametrize("signal, message", [
+    (lambda z: z + 10, "travel limit"),
+    (lambda z: 10 - z, "travel limit"),
+    (lambda z: 1, "flat"),
+    (lambda z: float("nan"), "Invalid camera frame"),
+])
+def test_laser_peak_rejects_unbracketed_or_invalid_signal(signal, message):
+    engine = object.__new__(RamanEngine)
+    engine._last_operation_reloaded = False
+    engine.try_set_ZPosition = MagicMock()
+    engine.try_snap = MagicMock(side_effect=lambda: np.full(
+        (3, 4), signal(engine.try_set_ZPosition.call_args.args[0])
+    ))
+    with pytest.raises(RuntimeError, match=message):
+        engine._laser_focus_peak(0, 2, 5, -6, 6)
+    assert all(-6 <= c.args[0] <= 6 for c in engine.try_set_ZPosition.call_args_list)
+
+
+def test_laser_fine_scan_extends_beyond_its_initial_window():
+    engine = object.__new__(RamanEngine)
+    engine._last_operation_reloaded = False
+    engine.try_set_ZPosition = MagicMock()
+    engine.try_snap = MagicMock(side_effect=lambda: np.full(
+        (3, 4), 1e6 * np.exp(-(engine.try_set_ZPosition.call_args.args[0] - 1.5) ** 2)
+    ))
+    assert engine._laser_focus_peak(0, 0.5, 5, -6, 6) == 1.5
+
+
+@pytest.mark.parametrize("center", [0.0, 99.1, -99.1])
+def test_fixed_fine_spacing_with_fractional_range_and_travel_bounds(center):
+    engine = object.__new__(RamanEngine)
+    engine._last_operation_reloaded = False
+    engine.try_set_ZPosition = MagicMock()
+    engine.try_snap = MagicMock(side_effect=lambda: np.full(
+        (3, 4), 1e6 * np.exp(-(engine.try_set_ZPosition.call_args.args[0] - center) ** 2)
+    ))
+    assert engine._laser_focus_peak(center, 12 / 7, 3, -100, 100, step_size=0.5) == center
+    positions = [c.args[0] for c in engine.try_set_ZPosition.call_args_list]
+    np.testing.assert_allclose(np.diff(positions), 0.5)
+    assert all(-100 <= z <= 100 for z in positions)
+
+
+@pytest.mark.parametrize("step_size", [None, 0.5])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_bilateral_extension_continues_when_one_side_is_bounded(step_size, direction):
+    engine = object.__new__(RamanEngine)
+    engine._last_operation_reloaded = False
+    engine.try_set_ZPosition = MagicMock()
+    peak = 3 * direction
+    engine.try_snap = MagicMock(side_effect=lambda: np.full(
+        (3, 4), 1e6 * np.exp(-(engine.try_set_ZPosition.call_args.args[0] - peak) ** 2)
+    ))
+    lower, upper = (-1, 5) if direction > 0 else (-5, 1)
+    assert engine._laser_focus_peak(0, 1, 5, lower, upper, step_size=step_size) == peak
+    positions = [c.args[0] for c in engine.try_set_ZPosition.call_args_list]
+    assert len(positions) == len(set(positions))
+    assert all(lower <= z <= upper for z in positions)
+    np.testing.assert_allclose(np.diff(sorted(positions)), 0.5)
+
+
+@pytest.mark.parametrize("step_size", [None, 0.5])
+@pytest.mark.parametrize("peak_score", [799_999, 800_000, 800_001])
+def test_laser_peak_score_threshold_is_strict(peak_score, step_size):
+    engine = object.__new__(RamanEngine)
+    engine._last_operation_reloaded = False
+    engine.try_set_ZPosition = MagicMock()
+    # A single row makes the camera score equal to the synthetic signal.
+    engine.try_snap = MagicMock(side_effect=lambda: np.array([[
+        peak_score * np.exp(-engine.try_set_ZPosition.call_args.args[0] ** 2)
+    ]]))
+    if peak_score > 8e5:
+        assert engine._laser_focus_peak(0, 1, 5, -3, 3, step_size=step_size) == 0
+        assert engine.try_snap.call_count == 5
+    else:
+        with pytest.raises(RuntimeError, match="score > 8e5"):
+            engine._laser_focus_peak(0, 1, 5, -3, 3, step_size=step_size)
+        positions = [c.args[0] for c in engine.try_set_ZPosition.call_args_list]
+        assert min(positions) == -3 and max(positions) == 3
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("step_size", [None, 0.5])
+def test_weak_bracketed_peak_keeps_searching_for_stronger_peak(direction, step_size):
+    engine = object.__new__(RamanEngine)
+    engine._last_operation_reloaded = False
+    engine.try_set_ZPosition = MagicMock()
+    def frame():
+        z = engine.try_set_ZPosition.call_args.args[0]
+        return np.array([[max(0.6e6 * np.exp(-z*z), 2e6 * np.exp(-4*(z-3*direction)**2))]])
+    engine.try_snap = MagicMock(side_effect=frame)
+    assert engine._laser_focus_peak(0, 1, 5, -5, 5, step_size=step_size) == 3 * direction
+    positions = [c.args[0] for c in engine.try_set_ZPosition.call_args_list]
+    assert min(positions) == -max(positions)
+    assert min(positions) < -3 and max(positions) > 3

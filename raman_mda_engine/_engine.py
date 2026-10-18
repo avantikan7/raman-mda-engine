@@ -132,9 +132,10 @@ class RamanEngine(MDAEngine):
             Number of Z planes in the coarse autofocus scan. Used by all
             autofocus objects (quartz/glass/cell/software/laser-coarse).
         fine_search_range : float
-            +/- Z range (um) for the laser autofocus FINE scan.
+            Legacy argument retained for compatibility. Laser fine range is
+            automatically one coarse sampling step on either side of the peak.
         fine_search_pts : int
-            Number of Z planes in the laser autofocus FINE scan.
+            Legacy argument retained for compatibility. Fine scans use 0.5 um steps.
         image_x : int
             X size of the camera image in pixels.
         image_y : int
@@ -975,6 +976,70 @@ class RamanEngine(MDAEngine):
         target_xy = original_xy - stage_offset
         return tuple(original_xy), tuple(target_xy)
 
+    def _laser_focus_peak(self, center, half_range, points, lower, upper, step_size=None):
+        """Bracket a measured maximum above 8e5, extending both ends within Z bounds."""
+        if not np.isfinite([center, half_range, lower, upper]).all() or half_range <= 0 or points < 3:
+            raise ValueError("Laser autofocus requires a positive range and at least 3 planes")
+        step = 2 * half_range / (points - 1)
+        positions = list(np.unique(np.clip(
+            np.linspace(center - half_range, center + half_range, points), lower, upper
+        )))
+        if step_size is not None:
+            step = float(step_size)
+            if not np.isfinite(step) or step <= 0:
+                raise ValueError("Autofocus step size must be positive and finite")
+            count = max(1, int(np.ceil(half_range / step)))
+            grid = center + np.arange(-count, count + 1) * step
+            positions = list(grid[(grid >= lower) & (grid <= upper)])
+            if not positions:
+                raise RuntimeError("No autofocus samples within travel bounds")
+        scores = []
+
+        def measure(z):
+            self.try_set_ZPosition(float(z))
+            if self._last_operation_reloaded:
+                raise RuntimeError("Hardware reloaded during laser autofocus")
+            frame = np.asarray(self.try_snap(), dtype=float)
+            if self._last_operation_reloaded:
+                raise RuntimeError("Hardware reloaded during laser autofocus")
+            if frame.ndim != 2 or not frame.size or not np.isfinite(frame).all():
+                raise RuntimeError("Invalid camera frame during laser autofocus")
+            score = float(frame.sum(axis=0).max())
+            trace = getattr(self, "_laser_autofocus_trace", None)
+            if trace is not None:
+                trace["samples"].append(dict(z=float(z), score=score, phase=self._laser_scan_phase))
+            return score
+
+        scores.extend(measure(z) for z in positions)
+        while True:
+            best = np.flatnonzero(np.asarray(scores) == max(scores))
+            first, last = int(best[0]), int(best[-1])
+            if first > 0 and last < len(scores) - 1 and max(scores) > 8e5:
+                return positions[int(best[len(best) // 2])]
+            if min(scores) == max(scores):
+                raise RuntimeError("Laser autofocus signal is flat; no peak found")
+            # Complete both sides of each expansion before selecting a peak.
+            # At a travel bound, keep exploring the other side if possible.
+            extended = False
+            for direction in (-1, 1):
+                edge = positions[0] if direction < 0 else positions[-1]
+                z = edge + direction * step
+                if step_size is None:
+                    z = max(lower, min(upper, z))
+                if z == edge or z < lower or z > upper:
+                    continue
+                print(f"[laser autofocus] extending search to Z={z:.3f}")
+                score = measure(z)
+                if direction < 0:
+                    positions.insert(0, z)
+                    scores.insert(0, score)
+                else:
+                    positions.append(z)
+                    scores.append(score)
+                extended = True
+            if not extended:
+                raise RuntimeError("Laser autofocus reached its travel limit without bracketing a peak with score > 8e5")
+
     def autofocus_w_raman(self, last_z, pt, t, p, max_volt=1.6, stage_xy=None):
         if stage_xy is not None and self._autofocus_object != "laser":
             xy = np.asarray(stage_xy, dtype=float)
@@ -1132,15 +1197,11 @@ class RamanEngine(MDAEngine):
                 "[laser autofocus] centering with stage: "
                 f"XY {original_xy} -> {autofocus_xy}"
             )
+            self._laser_autofocus_trace = dict(start_z=float(focusZ), best_z=None, samples=[], error=None)
+            self._laser_scan_phase = "coarse"
             try:
                 self.try_set_XYPosition(*autofocus_xy)
                 time.sleep(0.1)
-                coarse_Z = np.linspace(
-                    -search_range, search_range, search_pts
-                )
-                figs = []
-                something_broke = 0
-
                 self._laser_autofocus_active = True
                 self._mmc.setAutoShutter(False)
                 self._mmc.setShutterOpen(True)
@@ -1152,40 +1213,26 @@ class RamanEngine(MDAEngine):
                     np.array([volts[0], volts[0]]),
                     100,
                 )
-                for z in tqdm(coarse_Z):
-                    self.try_set_ZPosition(focusZ+z)
-                    self.try_setExp(0.1)
-                    fig = self.try_snap()
-                    figs.append(fig)
-                    if self._last_operation_reloaded:
-                        something_broke += 1
-                figs = np.asarray(figs)
-                # np.save(f'debug1/figs_{t}_{p}.npy', figs)
-                # np.save(f'debug1/zs_{t}_{p}.npy', coarse_Z + focusZ)
-                scores = figs.sum(axis=1)
-                coarse_max = coarse_Z[np.argmax(np.max(scores, axis=1))] + focusZ
-                # --- fine laser scan: uses dedicated fine_search_range / fine_search_pts ---
-                fine_Z = np.linspace(-self._fine_search_range, self._fine_search_range, self._fine_search_pts)
-                figs = []
-                something_broke = 0
-                for z in tqdm(fine_Z):
-                    self.try_set_ZPosition(coarse_max+z)
-                    # self.try_set_config("Channel", "RM")
-                    # self.try_setExp(0.1)
-                    fig = self.try_snap()
-                    figs.append(fig)
-                    if self._last_operation_reloaded:
-                        something_broke += 1
-                figs = np.asarray(figs)
-                # np.save(f'debug2/figs_{t}_{p}.npy', figs)
-                # np.save(f'debug2/zs_{t}_{p}.npy', fine_Z + coarse_max)
-                scores = figs.sum(axis=1)
-                max_laser_offset = (
-                    fine_Z[np.argmax(np.max(scores, axis=1))]
-                    - focusZ
-                    + coarse_max
+                # Bound every sampled position, not just the final selected offset.
+                lower, upper = focusZ - 100.0, focusZ + 100.0
+                coarse_range = min(search_range, 100.0)
+                self.try_setExp(0.1)
+                coarse_max = self._laser_focus_peak(
+                    focusZ, coarse_range, search_pts, lower, upper
                 )
+                self._laser_scan_phase = "fine"
+                fine_max = self._laser_focus_peak(
+                    coarse_max, 2 * coarse_range / (search_pts - 1), 3,
+                    lower, upper, step_size=0.5,
+                )
+                self._laser_autofocus_trace["best_z"] = float(fine_max)
+                max_laser_offset = fine_max - focusZ
+                something_broke = 0
                 coarse_raman = None
+            except Exception as exc:
+                self._laser_autofocus_trace["error"] = str(exc)
+                self.try_set_ZPosition(focusZ)
+                raise
             finally:
                 try:
                     self._laser_autofocus_active = False
@@ -1208,8 +1255,13 @@ class RamanEngine(MDAEngine):
                         "[laser autofocus] restored stage XY to "
                         f"{original_xy}"
                     )
+                    events = getattr(self, "raman_events", None)
+                    if events is not None:
+                        events.autofocusFinished.emit(self._laser_autofocus_trace)
+                    self._laser_autofocus_trace = None
         # self.try_setShutter("Fluoshutter", False)
-        if np.abs(max_laser_offset) >= 3*search_range or something_broke != 0:
+        offset_limit = 100.0 if object == "laser" else 3 * search_range
+        if np.abs(max_laser_offset) >= offset_limit or something_broke != 0:
             return focusZ, last_z, coarse_raman
         return focusZ, max_laser_offset+focusZ, coarse_raman
 
