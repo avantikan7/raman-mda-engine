@@ -27,6 +27,8 @@ def validate_grid(plan):
                 raise ValueError("Grid axes require finite bounds and positive integer counts")
         if region.get("snake_axis") not in (None, "x", "y"):
             raise ValueError("Invalid grid traversal order")
+        if region.get("order") not in (None, "row_wise", "column_wise", "row_wise_snake", "column_wise_snake", "spiral"):
+            raise ValueError("Invalid grid traversal order")
         if region.get("z") is not None and not math.isfinite(region["z"]):
             raise ValueError("Grid Z must be finite")
         surface = region.get("tilt")
@@ -43,6 +45,55 @@ def _axis_value(axis, index):
     return (start + stop) / 2 if count == 1 else start + (stop - start) * index / (count - 1)
 
 
+def grid_indices(index, rows, columns, order):
+    """Native MDA traversal without allocating a dense index mesh."""
+    if order != "spiral":
+        if order.startswith("row"):
+            row, column = divmod(index, columns)
+            if order.endswith("snake") and row % 2:
+                column = columns - 1 - column
+        else:
+            column, row = divmod(index, rows)
+            if order.endswith("snake") and column % 2:
+                row = rows - 1 - row
+        return row, column
+    xshift, yshift = (columns - 1) // 2, (rows - 1) // 2
+    xmin, xmax = -xshift, columns - 1 - xshift
+    ymin, ymax = -yshift, rows - 1 - yshift
+
+    def enclosed(radius):
+        if radius < 0:
+            return 0
+        return (min(xmax, radius) - max(xmin, -radius) + 1) * (min(ymax, radius) - max(ymin, -radius) + 1)
+
+    low, high = 0, max(rows, columns)
+    while low < high:
+        middle = (low + high) // 2
+        if enclosed(middle) > index:
+            high = middle
+        else:
+            low = middle + 1
+    radius = low
+    if radius == 0:
+        return yshift, xshift
+    offset = index - enclosed(radius - 1)
+    segments = [
+        (radius, max(1 - radius, ymin), min(radius, ymax), True, 1),
+        (radius, max(-radius, xmin), min(radius - 1, xmax), False, -1),
+        (-radius, max(-radius, ymin), min(radius - 1, ymax), True, -1),
+        (-radius, max(1 - radius, xmin), min(radius, xmax), False, 1),
+    ]
+    for fixed, start, stop, vertical, direction in segments:
+        if not ((xmin <= fixed <= xmax) if vertical else (ymin <= fixed <= ymax)):
+            continue
+        count = max(0, stop - start + 1)
+        if offset < count:
+            moving = start + offset if direction == 1 else stop - offset
+            return (moving + yshift, fixed + xshift) if vertical else (fixed + yshift, moving + xshift)
+        offset -= count
+    raise IndexError(index)
+
+
 def grid_position(sequence, index):
     """Calculate one position by index, including raster/snake order and tilt."""
     plan = sequence.metadata[GRID_KEY]
@@ -52,7 +103,9 @@ def grid_position(sequence, index):
         if index >= nx * ny:
             index -= nx * ny
             continue
-        if region.get("snake_axis") == "x":
+        if region.get("order"):
+            iy, ix = grid_indices(index, ny, nx, region["order"])
+        elif region.get("snake_axis") == "x":
             iy, ix = divmod(index, nx)
             if iy % 2:
                 ix = nx - 1 - ix

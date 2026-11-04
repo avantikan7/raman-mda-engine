@@ -103,7 +103,7 @@ class RamanEngine(MDAEngine):
         segment_every=None,
         autofocus_axes=("p", "t"),
         automatic_af_positions=False,
-        automatic_af_min_radius=20.0,
+        automatic_af_min_radius=50.0,
     ) -> None:
         """
         Create a pymmcore-plus mda engine that also collects Raman data.

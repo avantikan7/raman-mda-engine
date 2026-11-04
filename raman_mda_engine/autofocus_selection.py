@@ -12,7 +12,7 @@ class FocusCandidate:
     radius_px: float
 
 
-def find_empty_patch(bf, fluorescence=(), *, margin_px=10, min_radius_px=20):
+def find_empty_patch(bf, fluorescence=(), *, margin_px=10, min_radius_px=50):
     """Return the largest candidate patch in registered, full-resolution frames.
 
     Distances are camera pixels. BF is optional when fluorescence is acquired;
