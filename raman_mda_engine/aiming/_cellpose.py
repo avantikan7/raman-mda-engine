@@ -7,6 +7,21 @@ import os
 from pathlib import Path
 
 
+def _use_gpu() -> bool:
+    """Use CUDA or Apple MPS when available; set RAMAN_CELLPOSE_GPU=0 to force CPU."""
+    if os.environ.get("RAMAN_CELLPOSE_GPU", "1").strip().lower() in {"0", "false", "no"}:
+        return False
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(
+        torch.cuda.is_available()
+        or getattr(torch.backends, "mps", None) is not None
+        and torch.backends.mps.is_available()
+    )
+
+
 def _model_path(model) -> Path | None:
     """Return a validated custom-model path, or ``None`` for a model name."""
     text = os.fspath(model).strip()
@@ -53,7 +68,7 @@ def new_cellpose_model(model="cyto2"):
         if custom_path is not None:
             return cellpose_model(
                 pretrained_model=str(custom_path),
-                gpu=False,
+                gpu=_use_gpu(),
             )
         legacy = hasattr(models, "Cellpose")
         builtin_names = getattr(models, "MODEL_NAMES", ())
@@ -69,13 +84,13 @@ def new_cellpose_model(model="cyto2"):
             # Preserve the original Cellpose <=3 path for built-in models.
             # The wrapper owns the ``cp`` inference model used by this project
             # before custom-model support was added.
-            return models.Cellpose(model_type=str(model), gpu=False)
+            return models.Cellpose(model_type=str(model), gpu=_use_gpu())
         if legacy:
             # Custom/model-zoo models need no size file. The Cellpose wrapper
             # requires one, even though we only evaluate its inference model.
-            return cellpose_model(model_type=str(model), gpu=False)
+            return cellpose_model(model_type=str(model), gpu=_use_gpu())
         # Cellpose >=4: built-in and registered names use pretrained_model.
-        return cellpose_model(pretrained_model=str(model), gpu=False)
+        return cellpose_model(pretrained_model=str(model), gpu=_use_gpu())
     except Exception as exc:
         compatibility_hint = (
             " Use the Cellpose version/architecture used to train these weights; "
