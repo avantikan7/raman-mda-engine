@@ -105,3 +105,31 @@ def link_labels_across_z(stack_masks, min_iou: float = 0.3):
                 next_label += 1
             out[z][plane == label] = new
     return out
+
+
+def droplet_point_rows(targets_by_z, include_grid=True, best_plane_only=True):
+    """Flatten per-plane droplet targets into laser aim points.
+
+    ``targets_by_z`` maps a z index to the list returned by ``droplet_targets``
+    (each item optionally carrying a ``track`` id from z-linking). Returns a list
+    of ``(z, droplet_id, kind, y, x)`` with ``kind`` in ``{"aim", "grid"}``. With
+    ``best_plane_only`` each droplet contributes only its widest plane (largest
+    inscribed radius), so it is sampled once instead of once per plane. The aim
+    point comes first, then the grid points inside the droplet.
+    """
+    best = {}
+    for z, targets in targets_by_z.items():
+        for t in targets:
+            d = t.get("track", t["label"])
+            if d not in best or t["radius"] > best[d][1]:
+                best[d] = (z, t["radius"])
+    rows = []
+    for z in sorted(targets_by_z):
+        for t in targets_by_z[z]:
+            d = t.get("track", t["label"])
+            if best_plane_only and best[d][0] != z:
+                continue
+            rows.append((z, d, "aim", int(t["aim"][0]), int(t["aim"][1])))
+            if include_grid:
+                rows.extend((z, d, "grid", int(y), int(x)) for y, x in t["grid"])
+    return rows

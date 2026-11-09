@@ -55,3 +55,18 @@ def test_link_labels_across_z_keeps_ids_and_starts_new_ones():
     a = out[0][20, 20]
     b = out[1][45, 45]
     assert out[1][21, 20] == a and a != b and out[2][45, 46] == b
+
+
+def test_droplet_point_rows_best_plane_and_grid_options():
+    from raman_mda_engine.aiming.droplets import droplet_point_rows
+
+    small = {"label": 1, "track": 7, "radius": 5.0, "aim": np.array([10, 10]),
+             "grid": np.array([[10, 12], [12, 10]])}
+    wide = {"label": 2, "track": 7, "radius": 9.0, "aim": np.array([11, 11]),
+            "grid": np.array([[11, 14]])}
+    by_z = {0: [small], 1: [wide]}
+    rows = droplet_point_rows(by_z)
+    assert {r[0] for r in rows} == {1}                      # only the widest plane
+    assert [r[2] for r in rows] == ["aim", "grid"]
+    assert len(droplet_point_rows(by_z, include_grid=False)) == 1
+    assert len(droplet_point_rows(by_z, best_plane_only=False)) == 5
